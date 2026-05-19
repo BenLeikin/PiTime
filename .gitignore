@@ -1,0 +1,12 @@
+*.bak
+*.bak[0-9]*
+*.key
+*.crt
+*.pem
+chrony.drift
+chrony.keys
+visitors.json
+__pycache__/
+*.pyc
+.env
+*.swp

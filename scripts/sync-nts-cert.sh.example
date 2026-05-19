@@ -1,0 +1,20 @@
+#!/bin/bash
+set -e
+
+CERT_SRC=/etc/nginx/ssl/example.com.fullchain.crt
+KEY_SRC=/etc/nginx/ssl/example.com.key
+TIME_HOST=YOUR_TIME_SERVER_IP
+TIME_PORT=22
+SSH_KEY=/root/.ssh/cert_sync
+DEST_DIR=/etc/chrony/nts
+
+SSH_OPTS="-p ${TIME_PORT} -i ${SSH_KEY} -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+
+ssh ${SSH_OPTS} root@${TIME_HOST} "cat > ${DEST_DIR}/fullchain.crt && chmod 644 ${DEST_DIR}/fullchain.crt && chown _chrony:_chrony ${DEST_DIR}/fullchain.crt" < ${CERT_SRC}
+
+ssh ${SSH_OPTS} root@${TIME_HOST} "cat > ${DEST_DIR}/privkey.key && chmod 600 ${DEST_DIR}/privkey.key && chown _chrony:_chrony ${DEST_DIR}/privkey.key" < ${KEY_SRC}
+
+ssh ${SSH_OPTS} root@${TIME_HOST} "systemctl reload-or-restart chrony"
+
+logger -t sync-nts-cert "NTS cert synced to ${TIME_HOST} successfully"
+

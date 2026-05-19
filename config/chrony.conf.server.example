@@ -1,0 +1,40 @@
+# GPS via gpsd, PPS-disciplined on SHM unit 2
+#refclock SHM 2 refid GPS precision 1e-7 prefer
+
+# Internet sanity-check sources
+pool time.cloudflare.com iburst maxsources 4
+pool 2.pool.ntp.org iburst maxsources 3
+
+# Serving
+allow all
+local stratum 10
+
+# Behavior
+makestep 0.1 3
+maxupdateskew 100.0
+maxdistance 16.0
+minsources 2
+rtcsync
+leapsectz right/UTC
+
+# Standard
+keyfile /etc/chrony/chrony.keys
+driftfile /var/lib/chrony/chrony.drift
+logdir /var/log/chrony
+log tracking measurements statistics refclocks
+hwclockfile /etc/adjtime
+cmdallow 127.0.0.1
+clientloglimit 10000000
+log tracking measurements statistics refclocks
+
+# NTS (Network Time Security) server
+ntsserverkey /etc/chrony/nts/privkey.key
+ntsservercert /etc/chrony/nts/fullchain.crt
+ntsport 4460
+ntsdumpdir /var/lib/chrony
+ntsntpserver time.example.com
+
+# GPS time via gpsd SHM (NMEA, low precision)
+refclock SHM 2 refid NMEA precision 1e-3 offset 0.0 delay 0.2 noselect
+# PPS pulse from GPIO (high precision, used for sync)
+refclock PPS /dev/pps0 refid PPS lock NMEA precision 1e-9 prefer
