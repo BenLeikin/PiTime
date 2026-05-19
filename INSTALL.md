@@ -123,7 +123,7 @@ refclock PPS /dev/pps0 refid PPS lock NMEA precision 1e-9 prefer
 pool time.cloudflare.com iburst maxsources 4
 pool 2.pool.ntp.org iburst maxsources 3
 
-# Serve the LAN
+# Serve the LAN (Your LAN here)
 allow 192.168.0.0/16
 allow 10.0.0.0/8
 ```
