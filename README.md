@@ -35,9 +35,8 @@ Real numbers from a running instance:
 
 ## Hardware
 
-- **Raspberry Pi 4 Model B** (4GB recommended)
+- **Raspberry Pi 4 Model B
 - **GT-U7 GPS module** (NEO-6M based, ~$10-15 on Amazon)
-- **Active GPS antenna** with U.FL connector (often included with the module)
 - **MicroSD card** 32GB+
 - **Case with passive cooling**
 
