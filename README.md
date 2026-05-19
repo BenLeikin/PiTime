@@ -4,7 +4,7 @@ A self-hosted, GPS-disciplined Stratum 1 time server running on a Raspberry Pi 4
 
 Built for accuracy, transparency, and learning. Achieves sub-microsecond offset and ~200ns PPS jitter using a $15 GPS module and the Pi's built-in GPIO PPS support.
 
-![Dashboard Screenshot](docs/images/dashboard.png)
+https://ntp.pilg0re.net
 
 ## What it does
 
