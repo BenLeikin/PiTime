@@ -35,7 +35,7 @@ Real numbers from a running instance:
 
 ## Hardware
 
-- **Raspberry Pi 4 Model B
+- **Raspberry Pi 4 Model B (any model will work, this project really doesn't need much proc power or memory at all)
 - **GT-U7 GPS module** (NEO-6M based, ~$10-15 on Amazon)
 - **MicroSD card** 32GB+
 - **Case with passive cooling**
