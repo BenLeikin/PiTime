@@ -1,5 +1,7 @@
 # GPS-Disciplined Stratum 1 NTP Server on Raspberry Pi
 
+As mentioned here: https://www.hackster.io/news/got-the-time-ben-leikin-does-thanks-to-a-stratum-1-time-server-built-from-a-raspberry-pi-755764618216
+
 A self-hosted, GPS-disciplined Stratum 1 time server running on a Raspberry Pi 4, with a live mission-control style web dashboard, PTP master support, and NTS (Network Time Security) authentication.
 
 Built for accuracy, transparency, and learning. Achieves sub-microsecond offset and ~200ns PPS jitter using a $15 GPS module and the Pi's built-in GPIO PPS support.
