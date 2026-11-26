@@ -1,0 +1,19 @@
+# The Pi runs Python 3.11 (Raspberry Pi OS Bookworm).
+target-version = "py311"
+line-length = 100
+extend-include = ["etc/NetworkManager/dispatcher.d/50-link-failover-garp"]
+
+[lint]
+select = [
+    "E", "F", "W",   # pycodestyle and pyflakes: real errors and unused names
+    "B",             # likely bugs
+    "BLE", "S110",   # blanket excepts, and except-pass that hides errors
+    "UP",            # idioms outdated for the target Python
+    "SIM", "C4",     # needless complexity
+    "PLW", "PLE",    # pylint warnings and errors
+    "ISC",           # accidental string concatenation
+]
+
+[lint.per-file-ignores]
+# Tests patch module globals and compare against long recorded lines.
+"tests/*" = ["E501"]

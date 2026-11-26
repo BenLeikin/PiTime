@@ -1,0 +1,32 @@
+# Runs tools/check.sh on every push.
+#
+# Written for a runner that uses the shell executor: jobs run directly on the
+# runner's machine as the gitlab-runner user, with whatever is installed
+# there. It needs python3 (with venv) and git. The JavaScript checks run if
+# node is installed and are skipped with a note if it is not.
+stages:
+  - check
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # Pinned so a new linter release cannot fail an unchanged commit.
+  RUFF_VERSION: "0.17.6"
+  SHELLCHECK_PY_VERSION: "0.11.0.1"
+
+checks:
+  stage: check
+  script:
+    # The linters go into a virtualenv kept between jobs. Its name carries the
+    # pinned versions, so changing a version builds a fresh one.
+    - LINT_ENV="$HOME/.cache/opentimeserver-lint-$RUFF_VERSION-$SHELLCHECK_PY_VERSION"
+    - |
+      if [ ! -x "$LINT_ENV/bin/ruff" ] || [ ! -x "$LINT_ENV/bin/shellcheck" ]; then
+        rm -rf "$LINT_ENV"
+        python3 -m venv "$LINT_ENV"
+        "$LINT_ENV/bin/pip" install --quiet "ruff==$RUFF_VERSION" "shellcheck-py==$SHELLCHECK_PY_VERSION"
+      fi
+    - export PATH="$LINT_ENV/bin:$PATH"
+    # A missing Python or shell tool fails the job...
+    - CHECK_STRICT=1 tools/check.sh python shell
+    # ...but node is optional on the runner.
+    - tools/check.sh js

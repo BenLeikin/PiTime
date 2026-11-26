@@ -25,7 +25,7 @@ import bisect
 import math
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 LOG_DIR = "/var/log/chrony"
 BIN_S = 300              # average both logs over 5-minute bins
@@ -40,7 +40,7 @@ MIN_R2 = 0.5
 
 def parse_time(date, clock):
     return datetime.strptime(f"{date} {clock}", "%Y-%m-%d %H:%M:%S").replace(
-        tzinfo=timezone.utc).timestamp()
+        tzinfo=UTC).timestamp()
 
 
 def parse_tempcomp(lines):
@@ -48,7 +48,7 @@ def parse_tempcomp(lines):
     out = []
     for line in lines:
         parts = line.split()
-        if len(parts) < 4 or not parts[0][:2] == "20":
+        if len(parts) < 4 or parts[0][:2] != "20":
             continue
         try:
             out.append((parse_time(parts[0], parts[1]), float(parts[2])))
@@ -62,7 +62,7 @@ def parse_tracking(lines, refid="PPS"):
     out = []
     for line in lines:
         parts = line.split()
-        if len(parts) < 6 or not parts[0][:2] == "20":
+        if len(parts) < 6 or parts[0][:2] != "20":
             continue
         if parts[2] != refid or parts[3] != "1":
             continue
@@ -130,7 +130,7 @@ def polyfit(xs, ys, degree):
     """Least-squares polynomial; returns coefficients lowest power first."""
     size = degree + 1
     matrix = [[sum(x ** (i + j) for x in xs) for j in range(size)] for i in range(size)]
-    rhs = [sum(y * x ** i for x, y in zip(xs, ys)) for i in range(size)]
+    rhs = [sum(y * x ** i for x, y in zip(xs, ys, strict=True)) for i in range(size)]
     return solve(matrix, rhs)
 
 
@@ -138,7 +138,7 @@ def r_squared(xs, ys, coeffs):
     mean = sum(ys) / len(ys)
     total = sum((y - mean) ** 2 for y in ys)
     resid = sum((y - sum(c * x ** i for i, c in enumerate(coeffs))) ** 2
-                for x, y in zip(xs, ys))
+                for x, y in zip(xs, ys, strict=True))
     return (1.0 - resid / total if total > 0 else 0.0), math.sqrt(resid / len(ys))
 
 
@@ -199,11 +199,11 @@ def report(result):
         f"Temperature: {r['temp_lo'] / 1000:.1f} to {r['temp_hi'] / 1000:.1f} C",
         f"Frequency:   mean {r['freq_mean']:.3f} ppm, spread (sd) {r['freq_sd']:.4f} ppm",
         f"Fit:         {r['model']}, explains {r['r2']:.0%} of the frequency changes",
-        f"             spread left after compensation: {r['resid_sd']:.4f} ppm "
-        f"({r['freq_sd'] / r['resid_sd']:.1f}x smaller)" if r["resid_sd"] > 0 else "",
+        (f"             spread left after compensation: {r['resid_sd']:.4f} ppm "
+         f"({r['freq_sd'] / r['resid_sd']:.1f}x smaller)") if r["resid_sd"] > 0 else "",
         f"Slope:       {-r['k1'] * 1000:+.4f} ppm per C at {r['t0'] / 1000:.1f} C",
-        f"Compensation at the coldest/hottest seen: "
-        f"{r['comp_at_extremes'][0]:+.3f} / {r['comp_at_extremes'][1]:+.3f} ppm",
+        ("Compensation at the coldest/hottest seen: "
+         f"{r['comp_at_extremes'][0]:+.3f} / {r['comp_at_extremes'][1]:+.3f} ppm"),
         "",
     ]
     if r["problems"]:
@@ -212,7 +212,7 @@ def report(result):
     else:
         out.append("chrony.conf line:")
         out.append("  " + r["line"])
-    return "\n".join(line for line in out if line is not None)
+    return "\n".join(out)
 
 
 def fetch(host, name):

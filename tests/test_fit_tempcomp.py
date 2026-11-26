@@ -4,7 +4,7 @@ import importlib.util
 import math
 import random
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -13,11 +13,11 @@ _spec = importlib.util.spec_from_file_location(
 ft = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ft)
 
-START = datetime(2026, 11, 26, 5, 0, 0, tzinfo=timezone.utc).timestamp()
+START = datetime(2026, 11, 26, 5, 0, 0, tzinfo=UTC).timestamp()
 
 
 def stamp(t):
-    return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(t, tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def make_logs(hours, slope_per_mc, curve=0.0, swing_mc=4000, noise=0.004, seed=1):
