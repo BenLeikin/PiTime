@@ -14,13 +14,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 PI_HOST="${PI_HOST:-timeserver}"
 STAGE=".opentimeserver-deploy"
-MODE=install
+MODE="install"
 CONFIGS=0
 YES=0
 
 for arg in "$@"; do
   case "$arg" in
-    --diff) MODE=diff ;;
+    --diff) MODE="diff" ;;
     --configs) CONFIGS=1 ;;
     --yes|-y) YES=1 ;;
     -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
@@ -33,10 +33,12 @@ log() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 FILES=(
   install.sh
   dashboard/chrony_dashboard.py
+  dashboard/static
   systemd/chrony-webpage.service
+  site
   etc/chrony/chrony.conf
   etc/default/gpsd
-  boot/firmware/config.txt
+  boot/firmware/config.txt.required
   etc/NetworkManager/dispatcher.d/50-link-failover-garp
   etc/sysctl.d/90-timeserver-failover.conf
   usr/local/sbin/timeserver-tune
@@ -64,17 +66,38 @@ tar -cf - "${FILES[@]}" | "${SSH[@]}" "rm -rf ~/$STAGE && mkdir -p ~/$STAGE && t
 remote_diff() {
   "${SSH[@]}" "cd ~/$STAGE && for pair in \
       dashboard/chrony_dashboard.py:/opt/chrony-dashboard/chrony_dashboard.py \
+      dashboard/static/index.html:/opt/chrony-dashboard/static/index.html \
+      dashboard/static/dashboard.css:/opt/chrony-dashboard/static/dashboard.css \
+      dashboard/static/dashboard.js:/opt/chrony-dashboard/static/dashboard.js \
       systemd/chrony-webpage.service:/etc/systemd/system/chrony-webpage.service \
+      site/etc/default/chrony-dashboard:/etc/default/chrony-dashboard \
       $1; do
     src=\${pair%%:*}; dst=\${pair#*:}
     if [ ! -e \"\$dst\" ]; then echo \"--- \$dst does not exist yet\"; continue; fi
     diff -u --label \"pi:\$dst\" --label \"repo:\$src\" \"\$dst\" \"\$src\" || true
   done"
 }
-CONFIG_PAIRS="etc/chrony/chrony.conf:/etc/chrony/chrony.conf etc/default/gpsd:/etc/default/gpsd boot/firmware/config.txt:/boot/firmware/config.txt etc/NetworkManager/dispatcher.d/50-link-failover-garp:/etc/NetworkManager/dispatcher.d/50-link-failover-garp etc/sysctl.d/90-timeserver-failover.conf:/etc/sysctl.d/90-timeserver-failover.conf usr/local/sbin/timeserver-tune:/usr/local/sbin/timeserver-tune systemd/timeserver-tune.service:/etc/systemd/system/timeserver-tune.service"
+CONFIG_PAIRS="etc/chrony/chrony.conf:/etc/chrony/chrony.conf \
+site/etc/chrony/conf.d/site.conf:/etc/chrony/conf.d/site.conf \
+etc/default/gpsd:/etc/default/gpsd \
+etc/NetworkManager/dispatcher.d/50-link-failover-garp:/etc/NetworkManager/dispatcher.d/50-link-failover-garp \
+etc/sysctl.d/90-timeserver-failover.conf:/etc/sysctl.d/90-timeserver-failover.conf \
+usr/local/sbin/timeserver-tune:/usr/local/sbin/timeserver-tune \
+systemd/timeserver-tune.service:/etc/systemd/system/timeserver-tune.service \
+site/etc/systemd/system/gitlab-runner.service.d/timeserver.conf:/etc/systemd/system/gitlab-runner.service.d/timeserver.conf"
+
+# Lines install.sh --configs would add to the Pi's boot config.
+boot_diff() {
+  "${SSH[@]}" "cd ~/$STAGE && while IFS=\$'\t' read -r pattern line; do
+      case \"\$pattern\" in ''|'#'*) continue ;; esac
+      grep -qE \"\$pattern\" /boot/firmware/config.txt 2>/dev/null \
+        || echo \"+++ /boot/firmware/config.txt would gain: \$line\"
+    done < boot/firmware/config.txt.required"
+}
 
 if [[ $MODE == diff ]]; then
   remote_diff "$CONFIG_PAIRS"
+  boot_diff
   exit 0
 fi
 
@@ -85,6 +108,7 @@ if [[ $CONFIGS -eq 1 ]]; then
       src=\${pair%%:*}; dst=\${pair#*:}
       diff -u --label \"pi:\$dst\" --label \"repo:\$src\" \"\$dst\" \"\$src\" 2>&1 || true
     done")"
+  cfg_diff+="$(boot_diff)"
   if [[ -z "$cfg_diff" ]]; then
     echo "    (none - Pi already matches the repo)"
   else

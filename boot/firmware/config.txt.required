@@ -1,0 +1,13 @@
+# Lines the time server needs in /boot/firmware/config.txt. install.sh
+# --configs adds whichever are missing, in an [all] section at the end of the
+# file, and leaves everything else in your config.txt alone.
+#
+# Each line is: <pattern that shows the setting is already there> <TAB> <line to add>
+
+# The GPS is on the Pi's primary UART.
+^\s*enable_uart=1	enable_uart=1
+# Free that UART from the onboard Bluetooth.
+^\s*dtoverlay=disable-bt	dtoverlay=disable-bt
+# PPS input. If you wired PPS to another pin, put your own pps-gpio line in
+# config.txt first and this one will not be added.
+^\s*dtoverlay=pps-gpio	dtoverlay=pps-gpio,gpiopin=18

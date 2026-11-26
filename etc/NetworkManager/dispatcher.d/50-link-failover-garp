@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """NetworkManager dispatcher: re-announce the server's address after a link change.
 
-The wired (end0) and Wi-Fi (wlan0) profiles both carry the same static
-address, with the wired one preferred by route metric. When the cable is
+The wired and Wi-Fi profiles both carry the same static address, with the
+wired one preferred by route metric. When the cable is
 unplugged or plugged back in, other machines still have the old interface's
 MAC address cached. A few gratuitous ARPs from the interface that now holds
 the default route update them, so failover takes seconds instead of waiting
@@ -12,25 +12,31 @@ NetworkManager calls this as: <script> <interface> <action>
 """
 
 import json
+import os
 import socket
 import struct
 import subprocess
 import sys
 import time
 
-IFACES = ("end0", "wlan0")
 ACTIONS = ("up", "down", "dhcp4-change")
 
 
+def is_physical(iface):
+    """True for real network hardware (Ethernet, Wi-Fi), not bridges or tunnels."""
+    return os.path.exists(f"/sys/class/net/{iface}/device")
+
+
 def _ip_json(*args):
-    out = subprocess.run(["ip", "-j", *args], capture_output=True, text=True).stdout
+    out = subprocess.run(["ip", "-j", *args], capture_output=True, text=True,
+                         check=False).stdout
     return json.loads(out or "[]")
 
 
 def active_iface():
-    """The watched interface whose default route has the lowest metric."""
+    """The physical interface whose default route has the lowest metric."""
     routes = [r for r in _ip_json("-4", "route", "show", "default")
-              if r.get("dev") in IFACES]
+              if is_physical(r.get("dev", ""))]
     if not routes:
         return None
     return min(routes, key=lambda r: r.get("metric", 0))["dev"]
@@ -44,8 +50,8 @@ def ipv4_addresses(iface):
 
 
 def gratuitous_arp(iface, ip, count=3, interval=0.5):
-    mac = bytes.fromhex(open(f"/sys/class/net/{iface}/address").read()
-                        .strip().replace(":", ""))
+    with open(f"/sys/class/net/{iface}/address") as f:
+        mac = bytes.fromhex(f.read().strip().replace(":", ""))
     addr = socket.inet_aton(ip)
     # ARP request with sender == target address (the form `arping -U` sends).
     arp = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 1,
@@ -60,7 +66,11 @@ def gratuitous_arp(iface, ip, count=3, interval=0.5):
 
 
 def main(argv):
-    if len(argv) < 3 or argv[1] not in IFACES or argv[2] not in ACTIONS:
+    # A "down" event can arrive after the device is gone, so only "up" events
+    # are checked against the hardware list.
+    if len(argv) < 3 or argv[2] not in ACTIONS:
+        return 0
+    if argv[2] != "down" and not is_physical(argv[1]):
         return 0
     time.sleep(1)  # let routes settle after the change
     iface = active_iface()

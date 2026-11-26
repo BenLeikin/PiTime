@@ -4,9 +4,10 @@ After=network-online.target chrony.service gpsd.service
 Wants=network-online.target
 
 [Service]
-# --trusted-proxy: the nginx host in front of the dashboard, so visitor counts
-# use the X-Real-IP it sends instead of counting everyone as the proxy.
-ExecStart=/usr/bin/python3 /opt/chrony-dashboard/chrony_dashboard.py --port 8080 --trusted-proxy 10.0.0.69
+# Site-specific options (reverse proxy address, time zone) come from
+# /etc/default/chrony-dashboard, so this unit is the same everywhere.
+EnvironmentFile=-/etc/default/chrony-dashboard
+ExecStart=/usr/bin/python3 /opt/chrony-dashboard/chrony_dashboard.py --port 8080 $DASHBOARD_OPTS
 Restart=always
 RestartSec=3
 WorkingDirectory=/opt/chrony-dashboard

@@ -4,13 +4,37 @@
 # reboot by itself, so undoing it is: disable the service and reboot.
 set -u
 
-# CPUs that take the ordinary interrupts. Not CPU 0 (see below) and not the
-# core reserved with isolcpus= in cmdline.txt.
-OTHER_CPUS="${OTHER_CPUS:-1-2}"
-OTHER_CPUS_MASK="${OTHER_CPUS_MASK:-6}"
 GPSD_DEVICE="${GPSD_DEVICE:-localhost:2947:/dev/serial0}"
 
 log() { echo "timeserver-tune: $*"; }
+
+# Expand a kernel CPU list such as "0-2,5" into "0 1 2 5".
+expand_cpus() {
+  local part out=()
+  local IFS=,
+  for part in $1; do
+    if [[ $part == *-* ]]; then
+      mapfile -t -O "${#out[@]}" out < <(seq "${part%-*}" "${part#*-}")
+    elif [[ -n $part ]]; then
+      out+=("$part")
+    fi
+  done
+  echo "${out[*]}" | tr ',' ' '
+}
+
+# CPUs that take the ordinary interrupts: every online CPU except CPU 0 (see
+# step 2) and any reserved with isolcpus= in cmdline.txt. Set OTHER_CPUS (a
+# list like "1,2") to override.
+other_cpus() {
+  local cpu isolated list=()
+  isolated=" $(expand_cpus "$(cat /sys/devices/system/cpu/isolated 2>/dev/null)") "
+  for cpu in $(expand_cpus "$(cat /sys/devices/system/cpu/online)"); do
+    [[ $cpu -eq 0 || $isolated == *" $cpu "* ]] && continue
+    list+=("$cpu")
+  done
+  (IFS=,; echo "${list[*]}")
+}
+OTHER_CPUS="${OTHER_CPUS:-$(other_cpus)}"
 
 # 1. Run the CPU at a fixed speed. With the default "ondemand" governor the
 #    speed (and so the delay before a PPS pulse is timestamped, and the board
@@ -25,16 +49,25 @@ done
 #    not let us move. So move every interrupt that can be moved (network, SD
 #    card and Wi-Fi, serial port...) to the other CPUs instead.
 pps_irq="$(awk '/pps/ { sub(":", "", $1); print $1; exit }' /proc/interrupts)"
-moved=0
-for dir in /proc/irq/[0-9]*; do
-  [ "${dir##*/}" = "$pps_irq" ] && continue
-  # Per-CPU interrupts (timers) refuse this; that is expected.
-  if echo "$OTHER_CPUS" > "$dir/smp_affinity_list" 2>/dev/null; then
-    moved=$((moved + 1))
-  fi
-done
-echo "$OTHER_CPUS_MASK" > /proc/irq/default_smp_affinity 2>/dev/null
-log "moved $moved interrupts to CPUs $OTHER_CPUS (PPS is irq ${pps_irq:-not found}, on CPU 0)"
+if [ -z "$OTHER_CPUS" ]; then
+  log "only one usable CPU: leaving interrupts where they are"
+else
+  moved=0
+  for dir in /proc/irq/[0-9]*; do
+    [ "${dir##*/}" = "$pps_irq" ] && continue
+    # Per-CPU interrupts (timers) refuse this; that is expected.
+    if echo "$OTHER_CPUS" > "$dir/smp_affinity_list" 2>/dev/null; then
+      moved=$((moved + 1))
+    fi
+  done
+  # Interrupts registered later (a USB device, say) default to the same CPUs.
+  mask=0
+  for cpu in ${OTHER_CPUS//,/ }; do
+    mask=$((mask | (1 << cpu)))
+  done
+  printf '%x\n' "$mask" > /proc/irq/default_smp_affinity 2>/dev/null
+  log "moved $moved interrupts to CPUs $OTHER_CPUS (PPS is irq ${pps_irq:-not found}, on CPU 0)"
+fi
 
 # 3. Tell the GPS its antenna does not move (u-blox dynamic model 2,
 #    "stationary"), which steadies its timing. The setting is not stored in the

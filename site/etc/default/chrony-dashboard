@@ -1,0 +1,9 @@
+# Site-specific options for the dashboard service (chrony-webpage.service).
+# See: python3 /opt/chrony-dashboard/chrony_dashboard.py --help
+#
+# --trusted-proxy IP   the reverse proxy in front of the dashboard. Its
+#                      X-Real-IP header is then believed, for visitor counts
+#                      and for deciding who is a local viewer. Remove it if
+#                      nothing proxies to the dashboard.
+# --timezone NAME      time zone of the header clock (default: the server's).
+DASHBOARD_OPTS="--trusted-proxy 10.0.0.69"
