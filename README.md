@@ -7,7 +7,9 @@ receiver's PPS pulse, and a web dashboard shows its live state.
   GPIO 18, which is numbered by the GPS NMEA time from gpsd. Internet pools
   act as sanity checks.
 - **gpsd** reads the GPS receiver on the Pi's UART (`/dev/serial0`) and passes
-  NMEA time to chrony through shared memory (SHM unit 2).
+  NMEA time to chrony through shared memory (SHM unit 0). Unit 2 is the
+  `/dev/pps0` pulse with the second taken from the system clock; it is not
+  GPS time of day, so chrony must not lock PPS to it.
 - **chrony_dashboard.py** is a single-file Python web dashboard (standard
   library only) on port 8080. It shows sync state, sources, GPS sky view,
   PPS jitter, clients and system health.
@@ -21,6 +23,8 @@ receiver's PPS pulse, and a web dashboard shows its live state.
 | `etc/chrony/chrony.conf` | `/etc/chrony/` | chrony: PPS + NMEA refclocks, pools, NTS |
 | `etc/default/gpsd` | `/etc/default/` | gpsd devices and options |
 | `boot/firmware/config.txt` | `/boot/firmware/` | Enables UART, disables Bluetooth, PPS on GPIO 18 |
+| `etc/NetworkManager/dispatcher.d/50-link-failover-garp` | `/etc/NetworkManager/dispatcher.d/` | Announces the address when the active link changes |
+| `etc/sysctl.d/90-timeserver-failover.conf` | `/etc/sysctl.d/` | Only the preferred link answers ARP |
 | `install.sh` | – | Installs on the Pi (run as root) |
 | `deploy.sh` | – | Uploads to the Pi over SSH and runs `install.sh` |
 | `tests/` | – | Parser tests using recorded chronyc/gpsd output |
@@ -67,7 +71,11 @@ sudo nmcli con mod <wifi-profile> $S ipv4.route-metric 600 802-11-wireless.power
 
 `etc/NetworkManager/dispatcher.d/50-link-failover-garp` (installed with
 `--configs`) sends gratuitous ARPs from whichever interface takes over, so
-other machines switch to its MAC address within seconds. Expect NTP clients to
+other machines switch to its MAC address within seconds.
+`etc/sysctl.d/90-timeserver-failover.conf` sets `arp_filter`, so while the
+cable is in, only the wired interface answers ARP for the address; otherwise
+clients could send requests over Wi-Fi and get replies by cable, which skews
+their measured offset. Expect NTP clients to
 see millisecond-level jitter while the Pi is on Wi-Fi. The Pi's own clock
 stays PPS-disciplined either way.
 
@@ -97,8 +105,13 @@ sudo password. Config files are backed up on the Pi as
 ## Dashboard
 
 ```
-python3 chrony_dashboard.py [--port 8080] [--bind 0.0.0.0] [--pps-refid PPS] [--cache-ttl 2]
+python3 chrony_dashboard.py [--port 8080] [--bind 0.0.0.0] [--pps-refid PPS]
+                           [--cache-ttl 2] [--trusted-proxy IP]...
 ```
+
+Behind a reverse proxy, pass its address with `--trusted-proxy` (set in the
+systemd unit) and have it send `X-Real-IP`. Visitor counts then use the real
+visitor address; the header is ignored from anyone else.
 
 - `GET /` serves the dashboard page.
 - `GET /api/status` returns the full JSON snapshot. One snapshot is shared by

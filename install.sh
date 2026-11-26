@@ -77,6 +77,10 @@ if [[ $WITH_CONFIGS -eq 1 ]]; then
   fi
   install_config etc/NetworkManager/dispatcher.d/50-link-failover-garp \
     /etc/NetworkManager/dispatcher.d/50-link-failover-garp 0755 || true
+  if install_config etc/sysctl.d/90-timeserver-failover.conf \
+      /etc/sysctl.d/90-timeserver-failover.conf; then
+    /usr/sbin/sysctl -q -p /etc/sysctl.d/90-timeserver-failover.conf
+  fi
   if install_config boot/firmware/config.txt /boot/firmware/config.txt; then
     echo "    NOTE: config.txt changed - reboot the Pi for it to take effect"
   fi

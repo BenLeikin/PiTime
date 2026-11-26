@@ -38,6 +38,7 @@ FILES=(
   etc/default/gpsd
   boot/firmware/config.txt
   etc/NetworkManager/dispatcher.d/50-link-failover-garp
+  etc/sysctl.d/90-timeserver-failover.conf
 )
 
 if command -v git >/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then
@@ -68,7 +69,7 @@ remote_diff() {
     diff -u --label \"pi:\$dst\" --label \"repo:\$src\" \"\$dst\" \"\$src\" || true
   done"
 }
-CONFIG_PAIRS="etc/chrony/chrony.conf:/etc/chrony/chrony.conf etc/default/gpsd:/etc/default/gpsd boot/firmware/config.txt:/boot/firmware/config.txt etc/NetworkManager/dispatcher.d/50-link-failover-garp:/etc/NetworkManager/dispatcher.d/50-link-failover-garp"
+CONFIG_PAIRS="etc/chrony/chrony.conf:/etc/chrony/chrony.conf etc/default/gpsd:/etc/default/gpsd boot/firmware/config.txt:/boot/firmware/config.txt etc/NetworkManager/dispatcher.d/50-link-failover-garp:/etc/NetworkManager/dispatcher.d/50-link-failover-garp etc/sysctl.d/90-timeserver-failover.conf:/etc/sysctl.d/90-timeserver-failover.conf"
 
 if [[ $MODE == diff ]]; then
   remote_diff "$CONFIG_PAIRS"
