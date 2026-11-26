@@ -32,6 +32,12 @@ SOURCESTATS_CSV = """\
 162.159.200.123,32,13,28964,0.163,0.181,0.001009292,0.002714957
 """
 
+# `chronyc -c selectdata` from the Pi: NMEA has the noselect option.
+SELECTDATA_CSV = """\
+N,NMEA,N,N,-,-,-,-,N,-,-,-,-,0,1.0,0.000000000,0.000000000,Normal
+*,PPS,N,-,P,-,-,-,-,P,-,-,-,10,1.0,-0.000001855,-0.000000891,Normal
+"""
+
 CLIENTS_CSV = """\
 192.168.1.20,1234,5,6,-,17,0,0,-,4294967295
 2001:db8::1,42,0,10,-,3600,0,0,-,4294967295
@@ -106,7 +112,22 @@ class ChronycParserTests(unittest.TestCase):
         self.assertEqual(pps["mode"], "refclock")
         self.assertEqual(pps["last_sample_offset"], "+12ns")
         self.assertEqual(pps["margin"], "±101ns")
-        self.assertEqual(nmea["state"], "unreachable")
+        # Answers (reach 377) but '?', and selectdata wasn't authorised.
+        self.assertEqual(nmea["state"], "unusable")
+
+    def test_noselect_from_selectdata(self):
+        with mock.patch.object(cd, "run", fake_run({"sources": SOURCES_CSV,
+                                                     "selectdata": SELECTDATA_CSV})):
+            states = {s["name"]: s["state"] for s in cd.parse_sources()}
+        self.assertEqual(states["NMEA"], "noselect")
+        self.assertEqual(states["PPS"], "synced")
+        self.assertEqual(states["10.0.0.16"], "unreachable")
+
+    def test_selectdata_not_authorised(self):
+        with mock.patch.object(cd, "run", fake_run({"sources": SOURCES_CSV,
+                                                     "selectdata": "501 Not authorised"})):
+            states = {s["name"]: s["state"] for s in cd.parse_sources()}
+        self.assertEqual(states["NMEA"], "unusable")
 
     def test_sourcestats(self):
         with mock.patch.object(cd, "run", fake_run({"sourcestats": SOURCESTATS_CSV})):

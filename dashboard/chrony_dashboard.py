@@ -184,13 +184,37 @@ SOURCE_STATES = {
 SOURCE_MODES = {"^": "server", "=": "peer", "#": "refclock"}
 
 
+def parse_selectdata():
+    """Map source name -> selection state letter from `chronyc selectdata`.
+
+    selectdata needs an authorised (Unix socket) connection, so this is empty
+    unless the dashboard runs as root or _chrony. 'N' means the source has the
+    noselect option, as the NMEA refclock does when it only numbers PPS pulses.
+    """
+    return {row[1]: row[0]
+            for row in run_csv(["chronyc", "-n", "-c", "selectdata"])
+            if len(row) > 2}
+
+
+def source_state(state_char, reach, select_state=None):
+    if select_state == "N":
+        return "noselect"
+    if state_char == "?" and reach not in ("0", ""):
+        # chrony also shows '?' for sources that answer but fail its tests.
+        return "unusable"
+    return SOURCE_STATES.get(state_char, state_char)
+
+
 def parse_sources():
     # CSV columns: mode, state, name, stratum, poll, reach (octal), last rx (s),
     # adjusted offset (s), measured offset (s), error bound (s).
     sources = []
+    selectdata = None
     for row in run_csv(["chronyc", "-n", "-c", "sources"]):
         if len(row) < 10:
             continue
+        if selectdata is None:
+            selectdata = parse_selectdata()
         mode_char, state_char = row[0], row[1]
         offset = safe_float(row[7])
         measured = safe_float(row[8])
@@ -198,7 +222,7 @@ def parse_sources():
         sources.append({
             "mode_char":  mode_char,
             "state_char": state_char,
-            "state":      SOURCE_STATES.get(state_char, state_char),
+            "state":      source_state(state_char, row[5], selectdata.get(row[2])),
             "mode":       SOURCE_MODES.get(mode_char, "unknown"),
             "name":       row[2],
             "stratum":    row[3],
@@ -1347,7 +1371,7 @@ HTML = r"""<!DOCTYPE html>
   .state-synced       { color: var(--green);  border-color: var(--green-dim);  background: rgba(0,255,136,0.08); }
   .state-combined     { color: var(--amber);  border-color: var(--amber-dim);  background: rgba(255,170,0,0.08); }
   .state-not-combined { color: var(--blue);   border-color: var(--cyan-dim);   background: rgba(68,136,255,0.08); }
-  .state-unreachable, .state-false-ticker, .state-too-variable {
+  .state-unreachable, .state-unusable, .state-false-ticker, .state-too-variable {
     color: var(--red); border-color: var(--red); background: rgba(255,51,85,0.08);
   }
   .state-noselect {
@@ -2193,14 +2217,9 @@ function render(d) {
     sb.innerHTML = '<tr><td colspan="8" style="color:var(--muted);padding:1rem">No sources</td></tr>';
   } else {
     sb.innerHTML = sources.map(src => {
-      // Refclocks intentionally marked noselect (like NMEA) show as unreachable
-      // but it's not an error; relabel as "noselect" with neutral color
-      const isNoselectRefclock = src.mode === 'refclock' && src.state === 'unreachable';
-      const displayState = isNoselectRefclock ? 'noselect' : src.state;
-      const stateCls = isNoselectRefclock ? 'state-noselect' : stateClass(src.state);
       return `
       <tr>
-        <td><span class="state-badge ${esc(stateCls)}">${esc(displayState)}</span></td>
+        <td><span class="state-badge ${esc(stateClass(src.state))}">${esc(src.state)}</span></td>
         <td>${esc(src.name)}</td>
         <td>${esc(src.stratum)}</td>
         <td>${esc(src.poll)}</td>
@@ -2501,7 +2520,7 @@ const GLOSSARY = {
   'Connected Clients': 'Devices currently being served NTP time by this node.',
 
   // Time Sources table headers
-  'State': 'Source state symbol: * (synced), + (combined), - (not combined), ? (unreachable), x (false ticker), ~ (too variable).',
+  'State': 'Source state symbol: * (synced), + (combined), - (not combined), ? (unreachable, or unusable if it still answers), x (false ticker), ~ (too variable). Sources configured with noselect show as noselect.',
   'Source': 'Hostname, IP, or refclock identifier of the time source.',
   'Stratum': 'Stratum level reported by this source.',
   'Poll': 'log2 of the polling interval in seconds. A poll of 6 means querying every 64 seconds.',
