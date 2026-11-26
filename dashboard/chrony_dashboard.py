@@ -5,6 +5,9 @@ Chrony GPS Time Server Dashboard - Space-Age Edition
 Direct TCP query to gpsd (works regardless of service user).
 NASA/JPL-inspired mission control aesthetic.
 
+The page itself lives next to this file in static/ (index.html,
+dashboard.css, dashboard.js); this file is the server and the data collectors.
+
 Usage:
     python3 chrony_dashboard.py [--port 8080] [--bind 0.0.0.0]
 """
@@ -15,16 +18,32 @@ import subprocess
 import json
 import re
 import argparse
+import contextlib
 import socket
 import os
 import time
 import hashlib
+import ipaddress
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from html import escape as html_escape
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlsplit
-from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
+from datetime import datetime, UTC
+
+log = logging.getLogger("chrony-dashboard")
+log.addHandler(logging.NullHandler())  # main() sets up real logging
+_warned = {}
+
+
+def warn(key, message, every=300.0):
+    """Log a problem that may recur on every snapshot: once, then at most
+    every `every` seconds per key, so a lasting fault does not flood the log."""
+    now = time.monotonic()
+    if now - _warned.get(key, float("-inf")) >= every:
+        _warned[key] = now
+        log.warning(message)
 
 
 # ============================================================================
@@ -36,18 +55,91 @@ from datetime import datetime, timezone
 # ============================================================================
 VISITOR_DATA_DIR = "/var/lib/chrony-dashboard"
 VISITOR_FILE = os.path.join(VISITOR_DATA_DIR, "visitors.json")
-VISITOR_ACTIVE_S = 120
-# The User-Agent is whatever the client sends, so bound everything it can grow.
-VISITOR_MAX_UNIQUE = 50000       # stored fingerprints (about 1 MB on disk)
-VISITOR_MAX_RECENT = 5000        # fingerprints tracked as "viewing now"
-VISITOR_SAVE_INTERVAL_S = 30     # write the file at most this often
-_visitor_lock = threading.Lock()
-_visitor_recent = {}  # fingerprint -> last_seen_epoch
-_visitor_unique = set()  # all-time set of fingerprints
-_visitor_loaded = False
-_visitor_dirty = False
-_visitor_last_save = 0.0
-_visitor_last_prune = 0.0
+
+
+class VisitorLog:
+    """Who is looking at the page: how many now, and how many ever.
+
+    The User-Agent is whatever the client sends, so everything it can make
+    grow is bounded.
+    """
+
+    def __init__(self, path=VISITOR_FILE, active_s=120, max_unique=50000,
+                 max_recent=5000, save_interval_s=30):
+        self.path = path
+        self.active_s = active_s              # "viewing now" means seen this recently
+        self.max_unique = max_unique          # stored fingerprints (about 1 MB on disk)
+        self.max_recent = max_recent          # fingerprints tracked as viewing now
+        self.save_interval_s = save_interval_s  # write the file at most this often
+        self.recent = {}                      # fingerprint -> last seen (epoch)
+        self.unique = set()                   # every fingerprint ever recorded
+        self._lock = threading.Lock()
+        self._loaded = False
+        self._dirty = False
+        self._last_save = 0.0
+        self._last_prune = 0.0
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                self.unique = set(json.load(f).get("unique", []))
+        except FileNotFoundError:
+            self.unique = set()  # first run
+        except (OSError, ValueError, AttributeError) as e:
+            log.warning("visitor file %s unreadable, starting empty: %s", self.path, e)
+            self.unique = set()
+        self._loaded = True
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"unique": sorted(self.unique)}, f)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            warn("visitors-save", f"cannot save {self.path}: {e}")
+
+    def record(self, ip, ua):
+        fp = hashlib.sha256(f"{ip}|{ua[:256]}".encode()).hexdigest()[:16]
+        now = time.time()
+        with self._lock:
+            if not self._loaded:
+                self._load()
+            if now - self._last_prune >= 1.0:
+                cutoff = now - self.active_s
+                for k in [k for k, t in self.recent.items() if t < cutoff]:
+                    del self.recent[k]
+                self._last_prune = now
+            if fp in self.recent or len(self.recent) < self.max_recent:
+                self.recent[fp] = now
+            if fp not in self.unique and len(self.unique) < self.max_unique:
+                self.unique.add(fp)
+                self._dirty = True
+            if self._dirty and now - self._last_save >= self.save_interval_s:
+                self._save()
+                self._dirty = False
+                self._last_save = now
+
+    def stats(self):
+        cutoff = time.time() - self.active_s
+        with self._lock:
+            if not self._loaded:
+                self._load()
+            current = sum(1 for t in self.recent.values() if t >= cutoff)
+            return {"current": current, "total_unique": len(self.unique)}
+
+
+VISITORS = VisitorLog()
+
+
+def record_visitor(ip, ua):
+    VISITORS.record(ip, ua)
+
+
+def get_visitor_stats():
+    return VISITORS.stats()
+
 
 # Reverse proxies whose X-Real-IP header is believed (--trusted-proxy).
 TRUSTED_PROXIES = set()
@@ -62,68 +154,75 @@ def client_ip(peer_ip, headers):
     return peer_ip
 
 
-def _load_visitors():
-    global _visitor_unique, _visitor_loaded
+FORWARD_HEADERS = ("X-Real-IP", "X-Forwarded-For", "Forwarded")
+# Addresses that can only be on the server's own network. Listed explicitly:
+# ipaddress's is_private also covers documentation and other reserved ranges.
+LOCAL_NETWORKS = [ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",   # private IPv4
+    "127.0.0.0/8", "169.254.0.0/16",                    # loopback, link-local
+    "::1/128", "fc00::/7", "fe80::/10",                 # IPv6 equivalents
+)]
+
+
+def viewer_is_local(peer_ip, headers):
+    """Is this viewer on a private network, and so shown full details?
+
+    A request passed on by a trusted proxy counts by the address that proxy
+    reports. Any other request carrying forwarding headers came through a
+    proxy we know nothing about, so it is treated as public rather than
+    judged by the proxy's own (usually private) address.
+    """
+    if peer_ip in TRUSTED_PROXIES:
+        address = (headers.get("X-Real-IP") or "").strip()
+    elif any(headers.get(h) for h in FORWARD_HEADERS):
+        return False
+    else:
+        address = peer_ip
     try:
-        with open(VISITOR_FILE) as f:
-            data = json.load(f)
-            _visitor_unique = set(data.get("unique", []))
-    except Exception:
-        _visitor_unique = set()
-    _visitor_loaded = True
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return any(ip.version == net.version and ip in net for net in LOCAL_NETWORKS)
 
 
-def _save_visitors():
+def mask_address(host):
+    """Shorten an address to its network: 203.0.113.x, 2001:db8:1::x."""
     try:
-        os.makedirs(VISITOR_DATA_DIR, exist_ok=True)
-        tmp = VISITOR_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"unique": sorted(_visitor_unique)}, f)
-        os.replace(tmp, VISITOR_FILE)
-    except Exception:
-        pass
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return "hidden"
+    if address.version == 4:
+        return ".".join(host.split(".")[:3]) + ".x"
+    network = ipaddress.ip_network(f"{host}/48", strict=False).network_address
+    return str(network).rstrip(":") + "::x"
 
 
-def record_visitor(ip, ua):
-    global _visitor_dirty, _visitor_last_save, _visitor_last_prune
-    fp = hashlib.sha256(f"{ip}|{ua[:256]}".encode()).hexdigest()[:16]
-    now = time.time()
-    with _visitor_lock:
-        if not _visitor_loaded:
-            _load_visitors()
-        if now - _visitor_last_prune >= 1.0:
-            # Prune anything inactive from the recent map
-            cutoff = now - VISITOR_ACTIVE_S
-            for k in [k for k, t in _visitor_recent.items() if t < cutoff]:
-                del _visitor_recent[k]
-            _visitor_last_prune = now
-        if fp in _visitor_recent or len(_visitor_recent) < VISITOR_MAX_RECENT:
-            _visitor_recent[fp] = now
-        if fp not in _visitor_unique and len(_visitor_unique) < VISITOR_MAX_UNIQUE:
-            _visitor_unique.add(fp)
-            _visitor_dirty = True
-        if _visitor_dirty and now - _visitor_last_save >= VISITOR_SAVE_INTERVAL_S:
-            _save_visitors()
-            _visitor_dirty = False
-            _visitor_last_save = now
-
-
-def get_visitor_stats():
-    now = time.time()
-    cutoff = now - VISITOR_ACTIVE_S
-    with _visitor_lock:
-        if not _visitor_loaded:
-            _load_visitors()
-        current = sum(1 for t in _visitor_recent.values() if t >= cutoff)
-        total = len(_visitor_unique)
-    return {"current": current, "total_unique": total}
+def redact(data):
+    """A copy of a snapshot without what identifies the site or its clients:
+    client addresses are shortened, the server's own address and the antenna
+    position are left out. Sent to viewers who are not on a private network."""
+    out = dict(data, redacted=True)
+    out["clients"] = [dict(c, host=mask_address(c.get("host", "")))
+                      for c in data.get("clients", [])]
+    out["system"] = dict(data.get("system", {}), ip="—")
+    out["gps"] = dict(data.get("gps", {}), lat=None, lon=None)
+    return out
 
 
 def run(cmd, timeout=5):
+    """Output of a command, or "" if it could not be run.
+
+    A non-zero exit is not treated as a failure: chronyc exits non-zero with
+    "501 Not authorised" for reports the current user may not see, and the
+    parsers already ignore that text.
+    """
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=timeout, check=False)
         return result.stdout.strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError) as e:
+        warn("run:" + " ".join(cmd), f"{' '.join(cmd)} failed: {e}")
         return ""
 
 
@@ -155,14 +254,12 @@ def fmt_seconds(x, signed=True):
     """Format seconds the way chronyc does: +12ns, -9623us, -10ms, 4000ms."""
     if x is None:
         return "—"
-    a = abs(x)
-    for scale, unit in ((1e9, "ns"), (1e6, "us"), (1e3, "ms")):
-        if a * scale < 9999.5:
-            v = x * scale
+    value, unit = x, "s"
+    for scale, name in ((1e9, "ns"), (1e6, "us"), (1e3, "ms")):
+        if abs(x) * scale < 9999.5:
+            value, unit = x * scale, name
             break
-    else:
-        v, unit = x, "s"
-    return f"{v:+.0f}{unit}" if signed else f"{abs(v):.0f}{unit}"
+    return f"{value:+.0f}{unit}" if signed else f"{abs(value):.0f}{unit}"
 
 
 def fmt_interval(s):
@@ -463,7 +560,7 @@ def _read_gpsd(host="127.0.0.1", port=2947, timeout=3.0):
             s.settimeout(max(0.05, deadline - time.monotonic()))
             try:
                 data = s.recv(8192)
-            except socket.timeout:
+            except TimeoutError:
                 break
             if not data:
                 break
@@ -477,10 +574,8 @@ def _read_gpsd(host="127.0.0.1", port=2947, timeout=3.0):
                     consider(json.loads(line))
                 except (json.JSONDecodeError, AttributeError):
                     continue
-        try:
+        with contextlib.suppress(OSError):
             s.sendall(b'?WATCH={"enable":false};\n')
-        except OSError:
-            pass
     return tpv, sky, dops
 
 
@@ -522,8 +617,12 @@ def _gps_monitor(interval=FIX_MONITOR_INTERVAL_S):
     while True:
         try:
             _note_fix(_read_gpsd()[0])
-        except Exception:
+        except (OSError, ValueError) as e:
             _note_fix(None)
+            warn("gpsd", f"gpsd query failed: {e}")
+        except Exception:  # noqa: BLE001 - this thread must outlive any bug
+            _note_fix(None)
+            log.exception("gps monitor: unexpected error")
         time.sleep(interval)
 
 
@@ -582,7 +681,9 @@ def get_gpsd_data():
             "lat": lat, "lon": lon, "alt": alt,
             "satellites": sat_list,
         }
-    except Exception as e:
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        # Unreachable gpsd, or a report shaped differently than expected.
+        warn("gpsd", f"gpsd query failed: {e}")
         return {
             "available": False,
             **_note_fix(None),
@@ -591,10 +692,6 @@ def get_gpsd_data():
             "sats_used": 0, "sats_visible": 0, "best_snr": 0,
             "fix_mode": "—",
         }
-
-
-CPU_MAX_WINDOW_S = 30
-_cpu_prev = None  # (monotonic time, {cpu: (idle, total)}) from the last call
 
 
 def _cpu_snapshot():
@@ -608,36 +705,49 @@ def _cpu_snapshot():
     return cores
 
 
-def get_cpu_per_core():
-    """Per-core usage since the previous call.
+class CpuSampler:
+    """Per-core usage since the previous sample.
 
     Measuring across the gap between snapshots needs no sleep and averages
-    over a couple of seconds instead of a 0.2 s blip. Only the first call, or
-    one after a long idle gap, takes a short sample of its own.
+    over a couple of seconds instead of a 0.2 s blip. Only the first sample,
+    or one after a long idle gap, takes a short measurement of its own.
     """
-    global _cpu_prev
-    try:
-        now = time.monotonic()
-        prev = _cpu_prev
-        if prev is None or now - prev[0] > CPU_MAX_WINDOW_S:
-            prev = (now, _cpu_snapshot())
-            time.sleep(0.1)
+
+    def __init__(self, max_window_s=30):
+        self.max_window_s = max_window_s
+        self._previous = None  # (monotonic time, {cpu: (idle, total)})
+
+    def sample(self):
+        try:
             now = time.monotonic()
-        current = _cpu_snapshot()
-        _cpu_prev = (now, current)
-        result = []
-        for cpu_id in sorted(current):
-            if cpu_id not in prev[1]:
-                continue
-            idle1, total1 = prev[1][cpu_id]
-            idle2, total2 = current[cpu_id]
-            d_idle = idle2 - idle1
-            d_total = total2 - total1
-            usage = 100.0 * (1.0 - d_idle / d_total) if d_total > 0 else 0.0
-            result.append({"core": cpu_id, "usage": round(usage, 1)})
-        return result
-    except Exception:
-        return []
+            previous = self._previous
+            if previous is None or now - previous[0] > self.max_window_s:
+                previous = (now, _cpu_snapshot())
+                time.sleep(0.1)
+                now = time.monotonic()
+            current = _cpu_snapshot()
+            self._previous = (now, current)
+            result = []
+            for cpu_id in sorted(current):
+                if cpu_id not in previous[1]:
+                    continue
+                idle1, total1 = previous[1][cpu_id]
+                idle2, total2 = current[cpu_id]
+                d_idle = idle2 - idle1
+                d_total = total2 - total1
+                usage = 100.0 * (1.0 - d_idle / d_total) if d_total > 0 else 0.0
+                result.append({"core": cpu_id, "usage": round(usage, 1)})
+            return result
+        except (OSError, ValueError, IndexError) as e:
+            warn("cpu", f"cannot read /proc/stat: {e}")
+            return []
+
+
+CPU_SAMPLER = CpuSampler()
+
+
+def get_cpu_per_core():
+    return CPU_SAMPLER.sample()
 
 
 def get_pps_irq_count():
@@ -649,8 +759,8 @@ def get_pps_irq_count():
                     counts = [int(p) for p in parts[1:5] if p.isdigit()]
                     return {"total": sum(counts), "per_core": counts,
                             "name": parts[-1] if parts else "pps"}
-    except Exception:
-        pass
+    except (OSError, ValueError) as e:
+        warn("pps-irq", f"cannot read /proc/interrupts: {e}")
     return {"total": 0, "per_core": [], "name": "—"}
 
 
@@ -658,8 +768,8 @@ def get_isolated_cpus():
     try:
         with open("/sys/devices/system/cpu/isolated") as f:
             return f.read().strip() or "none"
-    except Exception:
-        return "—"
+    except OSError:
+        return "—"  # not every kernel exposes this
 
 
 def get_next_leap_second():
@@ -673,10 +783,10 @@ def get_next_leap_second():
         if m:
             ntp_ts = int(m.group(1))
             unix_ts = ntp_ts - 2208988800
-            expiry = datetime.fromtimestamp(unix_ts, tz=timezone.utc)
+            expiry = datetime.fromtimestamp(unix_ts, tz=UTC)
             return expiry.strftime("%Y-%m-%d")
-    except Exception:
-        pass
+    except (OSError, ValueError, OverflowError) as e:
+        warn("leap", f"cannot read {leap_file}: {e}")
     return None
 
 
@@ -685,7 +795,8 @@ def get_uptime():
     try:
         with open("/proc/uptime") as f:
             minutes = int(float(f.read().split()[0])) // 60
-    except Exception:
+    except (OSError, ValueError, IndexError) as e:
+        warn("uptime", f"cannot read /proc/uptime: {e}")
         return "—"
     days, rem = divmod(minutes, 1440)
     hours, mins = divmod(rem, 60)
@@ -697,20 +808,22 @@ def get_uptime():
 def get_system_info():
     hostname = socket.gethostname()
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-    except Exception:
-        ip = "—"
+        # Connecting a UDP socket sends nothing; it only makes the kernel pick
+        # the source address it would use for the default route. 192.0.2.1 is
+        # a documentation address, used so no real host is named.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 80))
+            ip = s.getsockname()[0]
+    except OSError:
+        ip = "—"  # no default route
     uptime_raw = get_uptime()
     temp_str = "—"
     try:
         with open("/sys/class/thermal/thermal_zone0/temp") as f:
             temp_c = round(int(f.read().strip()) / 1000, 1)
             temp_str = f"{temp_c}°C"
-    except Exception:
-        pass
+    except (OSError, ValueError) as e:
+        warn("temperature", f"cannot read the CPU temperature: {e}")
     mem_str = "—"
     try:
         with open("/proc/meminfo") as f:
@@ -722,14 +835,14 @@ def get_system_info():
             avail = int(avail_m.group(1))
             used_pct = round(100 * (total - avail) / total, 1)
             mem_str = f"{used_pct}% of {round(total/1024)}MB"
-    except Exception:
-        pass
+    except (OSError, ValueError, ZeroDivisionError) as e:
+        warn("memory", f"cannot read /proc/meminfo: {e}")
     load_str = "—"
     try:
         with open("/proc/loadavg") as f:
             load_str = " ".join(f.read().strip().split()[:3])
-    except Exception:
-        pass
+    except OSError as e:
+        warn("loadavg", f"cannot read /proc/loadavg: {e}")
     return {
         "hostname": hostname,
         "ip": ip,
@@ -737,7 +850,7 @@ def get_system_info():
         "temperature": temp_str,
         "memory": mem_str,
         "loadavg": load_str,
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "timestamp": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "epoch": time.time(),
         "isolated_cpus": get_isolated_cpus(),
     }
@@ -770,10 +883,18 @@ def compute_health(tracking, sources, gps):
         issues.append("Not synced to GPS")
         if status == "OK":
             status = "DEGRADED"
-    has_synced = any(s.get("state") == "synced" for s in sources)
-    if not has_synced:
+    synced = [s for s in sources if s.get("state") == "synced"]
+    if not synced:
         issues.append("No synced source")
         status = "FAULT"
+    for source in synced:
+        # chrony goes on naming a source as its reference after that source
+        # falls silent (seen: an hour on a dead PPS), so check that the
+        # selected source is still delivering samples.
+        if source.get("reach") in ("0", ""):
+            issues.append(f"{source.get('name')} is selected but has stopped responding")
+            if status == "OK":
+                status = "DEGRADED"
     return {"status": status, "issues": issues}
 
 
@@ -801,2083 +922,6 @@ def get_all_data():
     data = {name: future.result() for name, future in futures.items()}
     data["health"] = compute_health(data["tracking"], data["sources"], data["gps"])
     return data
-
-
-HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Time Server</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg-0: #03060a;
-    --bg-1: #050a12;
-    --bg-2: #0a121e;
-    --surface: #0a1422;
-    --surface-2: #0f1c30;
-    --border: #1a2c47;
-    --border-glow: #2d4a78;
-    --cyan: #00d4ff;
-    --cyan-dim: #007090;
-    --amber: #ffaa00;
-    --amber-dim: #8a5a00;
-    --green: #00ff88;
-    --green-dim: #00aa55;
-    --red: #ff3355;
-    --yellow: #ffd700;
-    --magenta: #ff00aa;
-    --blue: #4488ff;
-    --muted: #4a6080;
-    --text: #c0d0e0;
-    --heading: #e8f0ff;
-    --display: 'Orbitron', 'Arial', sans-serif;
-    --mono: 'Space Mono', 'Courier New', monospace;
-  }
-
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  html, body { background: var(--bg-0); }
-
-  body {
-    color: var(--text);
-    font-family: var(--mono);
-    min-height: 100vh;
-    overflow-x: hidden;
-    position: relative;
-  }
-
-  body::before {
-    content: '';
-    position: fixed;
-    inset: 0;
-    background:
-      radial-gradient(ellipse at 20% 30%, rgba(0,212,255,0.08) 0%, transparent 50%),
-      radial-gradient(ellipse at 80% 70%, rgba(255,170,0,0.06) 0%, transparent 50%),
-      radial-gradient(ellipse at 50% 100%, rgba(255,0,170,0.04) 0%, transparent 50%),
-      radial-gradient(1px 1px at 12% 18%, rgba(255,255,255,0.6) 0%, transparent 100%),
-      radial-gradient(1px 1px at 78% 12%, rgba(0,212,255,0.5) 0%, transparent 100%),
-      radial-gradient(2px 2px at 35% 65%, rgba(255,170,0,0.4) 0%, transparent 100%),
-      radial-gradient(1px 1px at 88% 55%, rgba(255,255,255,0.5) 0%, transparent 100%),
-      radial-gradient(1px 1px at 5% 80%, rgba(0,255,136,0.3) 0%, transparent 100%),
-      radial-gradient(1px 1px at 62% 38%, rgba(200,210,255,0.4) 0%, transparent 100%),
-      radial-gradient(1px 1px at 25% 92%, rgba(255,255,255,0.4) 0%, transparent 100%),
-      radial-gradient(1px 1px at 95% 88%, rgba(0,212,255,0.4) 0%, transparent 100%),
-      var(--bg-0);
-    pointer-events: none;
-    z-index: 0;
-  }
-
-  body::after {
-    content: '';
-    position: fixed;
-    inset: 0;
-    background: repeating-linear-gradient(
-      0deg, transparent 0, transparent 2px,
-      rgba(0,212,255,0.02) 2px, rgba(0,212,255,0.02) 3px
-    );
-    pointer-events: none;
-    z-index: 1;
-    mix-blend-mode: overlay;
-  }
-
-  .wrap {
-    position: relative;
-    z-index: 2;
-    max-width: 1400px;
-    margin: 0 auto;
-    padding: 1rem 1.25rem 4rem;
-  }
-
-  header {
-    border: 1px solid var(--border);
-    background: linear-gradient(135deg, var(--surface) 0%, var(--bg-1) 100%);
-    padding: 1rem 1.5rem;
-    margin-bottom: 1rem;
-    position: relative;
-    overflow: hidden;
-    display: grid;
-    grid-template-columns: auto auto 1fr auto;
-    gap: 1.5rem;
-    align-items: center;
-    clip-path: polygon(12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%, 0 12px);
-  }
-  header::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 1px;
-    background: linear-gradient(90deg, transparent, var(--cyan), transparent);
-  }
-  header::after {
-    content: '';
-    position: absolute;
-    bottom: 0; left: 0; right: 0;
-    height: 1px;
-    background: linear-gradient(90deg, transparent, var(--amber), transparent);
-  }
-
-  .mission-patch {
-    width: 70px; height: 70px;
-    border: 2px solid var(--cyan);
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: radial-gradient(circle, var(--bg-2) 0%, var(--bg-0) 100%);
-    position: relative;
-    flex-shrink: 0;
-    box-shadow: 0 0 20px rgba(0,212,255,0.3), inset 0 0 12px rgba(0,212,255,0.15);
-  }
-  .mission-patch::before {
-    content: '';
-    position: absolute;
-    inset: 4px;
-    border: 1px dashed var(--cyan-dim);
-    border-radius: 50%;
-    animation: rotate 30s linear infinite;
-  }
-  .mission-patch svg { width: 38px; height: 38px; }
-
-  @keyframes rotate {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
-  }
-
-  .header-text {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    min-width: 0;
-  }
-  .header-text .designation {
-    font-family: var(--display);
-    font-size: 0.7rem;
-    font-weight: 500;
-    letter-spacing: 0.4em;
-    color: var(--cyan);
-    text-transform: uppercase;
-  }
-  .header-text h1 {
-    font-family: var(--display);
-    font-size: clamp(1.5rem, 3vw, 2.2rem);
-    font-weight: 900;
-    color: var(--heading);
-    line-height: 1;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    text-shadow: 0 0 30px rgba(0,212,255,0.4);
-  }
-  .header-text h1 .accent { color: var(--amber); }
-  .header-text .subtitle {
-    font-size: 0.7rem;
-    color: var(--muted);
-    letter-spacing: 0.2em;
-    text-transform: uppercase;
-    margin-top: 0.2rem;
-  }
-
-  .local-time-block {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-self: center;
-    padding: 0.4rem 1.4rem;
-    border-left: 1px solid var(--border);
-    border-right: 1px solid var(--border);
-    min-width: 0;
-  }
-  .local-time-block .lt-label {
-    font-family: var(--display);
-    font-size: 0.6rem;
-    letter-spacing: 0.3em;
-    color: var(--cyan);
-    text-transform: uppercase;
-    margin-bottom: 0.25rem;
-  }
-  .local-time-block .lt-value {
-    font-family: var(--mono);
-    font-size: clamp(1.1rem, 2.2vw, 1.6rem);
-    font-weight: 700;
-    color: var(--heading);
-    line-height: 1;
-    letter-spacing: 0.04em;
-    text-shadow: 0 0 16px rgba(0,212,255,0.35);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .local-time-block .lt-ms {
-    color: var(--amber);
-    font-size: 0.75em;
-    font-weight: 500;
-  }
-  .local-time-block .lt-date {
-    font-family: var(--mono);
-    font-size: 0.65rem;
-    letter-spacing: 0.15em;
-    color: var(--muted);
-    text-transform: uppercase;
-    margin-top: 0.3rem;
-  }
-  @media (max-width: 900px) {
-    /* On mobile, stack the header vertically: patch+title on top, then
-       the Pacific clock, then the meta block. Trying to fit 4 columns
-       side-by-side at phone widths makes everything overlap. */
-    header {
-      grid-template-columns: auto 1fr;
-      grid-template-areas:
-        "patch  title"
-        "clock  clock"
-        "meta   meta";
-      gap: 1rem;
-      padding: 0.9rem 1rem;
-    }
-    .mission-patch { grid-area: patch; width: 56px; height: 56px; }
-    .mission-patch svg { width: 30px; height: 30px; }
-    .header-text { grid-area: title; }
-    .header-text h1 { font-size: 1.4rem; }
-    .header-text .designation { font-size: 0.6rem; letter-spacing: 0.25em; }
-    .header-text .subtitle { font-size: 0.6rem; letter-spacing: 0.12em; }
-    .local-time-block {
-      grid-area: clock;
-      border-left: none;
-      border-right: none;
-      border-top: 1px solid var(--border);
-      border-bottom: 1px solid var(--border);
-      padding: 0.6rem 0;
-      justify-self: stretch;
-      align-items: center;
-    }
-    .header-meta {
-      grid-area: meta;
-      grid-template-columns: max-content 1fr;
-      justify-content: start;
-      gap: 0.3rem 1rem;
-      width: 100%;
-    }
-    .header-meta dt { text-align: left; }
-  }
-  @media (max-width: 480px) {
-    .header-text h1 { font-size: 1.2rem; }
-    .local-time-block .lt-value { font-size: 1.3rem; }
-  }
-
-  /* Tooltip system - hover any element with [data-tip] to see definition */
-  [data-tip] {
-    position: relative;
-    cursor: help;
-  }
-  [data-tip]::after {
-    content: '?';
-    display: inline-block;
-    margin-left: 0.35em;
-    width: 0.95em;
-    height: 0.95em;
-    line-height: 0.85em;
-    text-align: center;
-    font-size: 0.65em;
-    font-weight: 700;
-    font-family: var(--display);
-    color: var(--cyan);
-    background: transparent;
-    border: 1px solid var(--cyan-dim);
-    border-radius: 50%;
-    vertical-align: 0.05em;
-    opacity: 0.55;
-    transition: opacity 0.15s, color 0.15s, border-color 0.15s;
-  }
-  [data-tip]:hover::after {
-    opacity: 1;
-    color: var(--amber);
-    border-color: var(--amber);
-  }
-  .tip-pop {
-    position: fixed;
-    z-index: 9999;
-    max-width: 340px;
-    padding: 0.7rem 0.9rem;
-    background: var(--bg-0);
-    border: 1px solid var(--cyan);
-    border-radius: 2px;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.6), 0 0 16px rgba(0,212,255,0.25);
-    font-family: var(--body);
-    font-size: 0.78rem;
-    line-height: 1.5;
-    color: var(--text);
-    letter-spacing: 0.02em;
-    text-transform: none;
-    pointer-events: none;
-    opacity: 0;
-    transform: translateY(4px);
-    transition: opacity 0.12s ease-out, transform 0.12s ease-out;
-    clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
-  }
-  .tip-pop.visible {
-    opacity: 1;
-    transform: translateY(0);
-  }
-  .tip-pop .tip-title {
-    display: block;
-    font-family: var(--display);
-    font-size: 0.65rem;
-    letter-spacing: 0.25em;
-    color: var(--amber);
-    text-transform: uppercase;
-    margin-bottom: 0.35rem;
-  }
-
-  .header-meta {
-    display: grid;
-    grid-template-columns: auto auto;
-    gap: 0.25rem 1rem;
-    font-size: 0.7rem;
-    align-items: center;
-  }
-  .header-meta dt {
-    color: var(--muted);
-    letter-spacing: 0.15em;
-    text-transform: uppercase;
-    font-size: 0.6rem;
-    text-align: right;
-  }
-  .header-meta dd {
-    color: var(--text);
-    font-family: var(--mono);
-    font-weight: 700;
-  }
-
-  .tx-indicator {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    padding: 0.2rem 0.5rem;
-    border: 1px solid var(--green-dim);
-    border-radius: 2px;
-    font-size: 0.6rem;
-    letter-spacing: 0.2em;
-    color: var(--green);
-    text-transform: uppercase;
-    font-family: var(--display);
-    font-weight: 700;
-  }
-  .tx-indicator::before {
-    content: '';
-    width: 6px; height: 6px;
-    background: var(--green);
-    border-radius: 50%;
-    box-shadow: 0 0 8px var(--green);
-    animation: blink 1.2s ease-in-out infinite;
-  }
-  @keyframes blink {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-  }
-  .tx-indicator.down { color: var(--red); border-color: var(--red); }
-  .tx-indicator.down::before {
-    background: var(--red); box-shadow: 0 0 8px var(--red); animation: none;
-  }
-
-  .banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 1rem 1.5rem;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    margin-bottom: 1rem;
-    font-family: var(--display);
-    font-weight: 700;
-    letter-spacing: 0.25em;
-    text-transform: uppercase;
-    font-size: 0.95rem;
-    position: relative;
-    overflow: hidden;
-    clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
-  }
-  .banner::before {
-    content: '';
-    position: absolute;
-    top: 0; bottom: 0; left: 0;
-    width: 6px;
-  }
-  .banner.ok { color: var(--green); }
-  .banner.ok::before { background: var(--green); box-shadow: 0 0 16px var(--green); }
-  .banner.degraded { color: var(--yellow); }
-  .banner.degraded::before { background: var(--yellow); box-shadow: 0 0 16px var(--yellow); }
-  .banner.fault { color: var(--red); animation: fault-flash 1s steps(2) infinite; }
-  .banner.fault::before { background: var(--red); box-shadow: 0 0 16px var(--red); }
-  @keyframes fault-flash {
-    0%   { background: var(--surface); }
-    50%  { background: rgba(255,51,85,0.1); }
-  }
-  .banner .issues {
-    font-family: var(--mono);
-    font-size: 0.7rem;
-    color: var(--muted);
-    text-transform: none;
-    letter-spacing: 0.05em;
-    font-weight: normal;
-  }
-
-  .skyview-card {
-    background: radial-gradient(ellipse at 50% 50%, var(--bg-2) 0%, var(--bg-0) 100%);
-    border: 1px solid var(--border);
-    margin-bottom: 1rem;
-    position: relative;
-    overflow: hidden;
-    clip-path: polygon(12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%, 0 12px);
-  }
-  .skyview-card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 2px;
-    background: linear-gradient(90deg, transparent, var(--cyan) 30%, var(--cyan) 70%, transparent);
-  }
-  .skyview-header {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 0.7rem 1.2rem 0.5rem;
-    border-bottom: 1px solid var(--border);
-    background: rgba(10,20,34,0.6);
-  }
-  .skyview-header .title {
-    font-family: var(--display);
-    font-size: 0.7rem;
-    font-weight: 700;
-    letter-spacing: 0.3em;
-    text-transform: uppercase;
-    color: var(--cyan);
-  }
-  .skyview-header .legend {
-    font-size: 0.65rem;
-    color: var(--muted);
-    letter-spacing: 0.05em;
-  }
-  .skyview-header .legend .dot {
-    display: inline-block;
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    margin: 0 4px 0 12px;
-    vertical-align: middle;
-  }
-  .skyview-header .legend .dot.used { background: var(--green); box-shadow: 0 0 6px var(--green); }
-  .skyview-header .legend .dot.visible { background: var(--muted); }
-
-  #skyview-canvas {
-    width: 100%;
-    height: 320px;
-    display: block;
-  }
-
-  .section-heading {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    margin: 1.5rem 0 0.7rem;
-    font-family: var(--display);
-    font-size: 0.7rem;
-    font-weight: 700;
-    letter-spacing: 0.35em;
-    text-transform: uppercase;
-    color: var(--cyan);
-  }
-  .section-heading::before, .section-heading::after {
-    content: '';
-    flex: 1;
-    height: 1px;
-    background: linear-gradient(90deg, transparent, var(--border-glow), transparent);
-  }
-  .section-heading .marker { color: var(--amber); }
-
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
-  .grid-3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 1rem; margin-bottom: 1rem; }
-  .grid-4 { display: grid; grid-template-columns: repeat(4,1fr); gap: 1rem; margin-bottom: 1rem; }
-  .full   { margin-bottom: 1rem; }
-
-  @media (max-width: 900px) {
-    .grid-3, .grid-4 { grid-template-columns: 1fr 1fr; }
-  }
-  @media (max-width: 600px) {
-    .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
-  }
-
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    padding: 1rem 1.2rem 1.1rem;
-    position: relative;
-    overflow: hidden;
-    clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
-    transition: border-color 0.2s;
-  }
-  .card:hover { border-color: var(--border-glow); }
-  .card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0;
-    width: 30%;
-    height: 1px;
-    background: var(--cyan);
-    box-shadow: 0 0 8px var(--cyan);
-  }
-  .card::after {
-    content: '';
-    position: absolute;
-    bottom: 0; right: 0;
-    width: 30%;
-    height: 1px;
-    background: var(--amber);
-    box-shadow: 0 0 8px var(--amber);
-  }
-
-  .card-title {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-family: var(--display);
-    font-size: 0.62rem;
-    font-weight: 700;
-    letter-spacing: 0.3em;
-    text-transform: uppercase;
-    color: var(--cyan);
-    margin-bottom: 0.9rem;
-    padding-bottom: 0.4rem;
-    border-bottom: 1px dashed var(--border);
-  }
-  .card-title::before {
-    content: '\25C6';
-    color: var(--amber);
-    font-size: 0.6rem;
-  }
-
-  .stat-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    padding: 0.3rem 0;
-    border-bottom: 1px solid rgba(45,74,120,0.15);
-    gap: 1rem;
-  }
-  .stat-row:last-child { border-bottom: none; }
-  .stat-key { color: var(--muted); font-size: 0.72rem; white-space: nowrap; letter-spacing: 0.05em; }
-  .stat-val { color: var(--text); font-size: 0.8rem; text-align: right; font-weight: 700; }
-  .stat-val.accent { color: var(--cyan); text-shadow: 0 0 10px rgba(0,212,255,0.3); }
-  .stat-val.amber  { color: var(--amber); text-shadow: 0 0 10px rgba(255,170,0,0.3); }
-  .stat-val.good   { color: var(--green); text-shadow: 0 0 10px rgba(0,255,136,0.3); }
-  .stat-val.bad    { color: var(--red);   text-shadow: 0 0 10px rgba(255,51,85,0.3); }
-  .stat-val.warn   { color: var(--yellow);}
-
-  .hero-stat { text-align: center; padding: 0.5rem 0; }
-  .hero-stat .val {
-    font-family: var(--display);
-    font-size: clamp(1.6rem, 3.8vw, 2.4rem);
-    font-weight: 900;
-    color: var(--amber);
-    line-height: 1;
-    letter-spacing: 0.02em;
-    text-shadow: 0 0 20px rgba(255,170,0,0.4);
-  }
-  .hero-stat .lbl {
-    font-family: var(--display);
-    font-size: 0.6rem;
-    color: var(--muted);
-    letter-spacing: 0.25em;
-    text-transform: uppercase;
-    margin-top: 0.4rem;
-  }
-  .hero-stat .sub {
-    font-size: 0.7rem;
-    color: var(--cyan-dim);
-    margin-top: 0.15rem;
-  }
-
-  .sparkline { width: 100%; height: 80px; margin-top: 0.5rem; }
-
-  .core-bar {
-    display: flex;
-    align-items: center;
-    gap: 0.7rem;
-    margin: 0.4rem 0;
-    font-size: 0.72rem;
-    font-family: var(--mono);
-  }
-  .core-bar .label {
-    width: 60px;
-    color: var(--muted);
-    letter-spacing: 0.05em;
-  }
-  .core-bar .label.isolated {
-    color: var(--magenta);
-    font-weight: 700;
-  }
-  .core-bar .track {
-    flex: 1;
-    height: 10px;
-    background: var(--bg-2);
-    border: 1px solid var(--border);
-    overflow: hidden;
-    position: relative;
-  }
-  .core-bar .track::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: repeating-linear-gradient(
-      90deg, transparent 0, transparent 9px,
-      rgba(45,74,120,0.3) 9px, rgba(45,74,120,0.3) 10px
-    );
-  }
-  .core-bar .fill {
-    height: 100%;
-    background: linear-gradient(90deg, var(--green), var(--amber));
-    transition: width 0.4s;
-    position: relative;
-    z-index: 1;
-  }
-  .core-bar .fill.isolated {
-    background: linear-gradient(90deg, var(--magenta), var(--cyan));
-  }
-  .core-bar .pct {
-    width: 48px;
-    text-align: right;
-    color: var(--text);
-    font-variant-numeric: tabular-nums;
-    font-weight: 700;
-  }
-
-  .world-clock {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    gap: 0.7rem;
-    margin-top: 0.3rem;
-  }
-  .tz-cell {
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    padding: 0.6rem 0.7rem;
-    text-align: center;
-    position: relative;
-    clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
-  }
-  .tz-cell::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 1px;
-    background: var(--cyan-dim);
-  }
-  .tz-cell .city {
-    font-family: var(--display);
-    font-size: 0.6rem;
-    color: var(--muted);
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    font-weight: 500;
-  }
-  .tz-cell .time {
-    font-family: var(--display);
-    font-size: 1.25rem;
-    color: var(--cyan);
-    font-weight: 700;
-    margin-top: 0.25rem;
-    font-variant-numeric: tabular-nums;
-    text-shadow: 0 0 12px rgba(0,212,255,0.4);
-  }
-  .tz-cell .date {
-    font-size: 0.62rem;
-    color: var(--cyan-dim);
-    margin-top: 0.15rem;
-    font-family: var(--mono);
-  }
-
-  .tbl-wrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.78rem; font-family: var(--mono); }
-  thead th {
-    text-align: left;
-    padding: 0.5rem 0.7rem;
-    font-family: var(--display);
-    font-size: 0.6rem;
-    letter-spacing: 0.2em;
-    text-transform: uppercase;
-    color: var(--cyan);
-    border-bottom: 1px solid var(--border-glow);
-    background: var(--surface-2);
-  }
-  tbody tr {
-    border-bottom: 1px solid rgba(45,74,120,0.15);
-    transition: background 0.15s;
-  }
-  tbody tr:hover { background: rgba(0,212,255,0.04); }
-  tbody td { padding: 0.5rem 0.7rem; color: var(--text); }
-
-  .state-badge {
-    display: inline-block;
-    padding: 0.15rem 0.6rem;
-    font-family: var(--display);
-    font-size: 0.6rem;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    border: 1px solid;
-  }
-  .state-synced       { color: var(--green);  border-color: var(--green-dim);  background: rgba(0,255,136,0.08); }
-  .state-combined     { color: var(--amber);  border-color: var(--amber-dim);  background: rgba(255,170,0,0.08); }
-  .state-not-combined { color: var(--blue);   border-color: var(--cyan-dim);   background: rgba(68,136,255,0.08); }
-  .state-unreachable, .state-unusable, .state-false-ticker, .state-too-variable {
-    color: var(--red); border-color: var(--red); background: rgba(255,51,85,0.08);
-  }
-  .state-noselect {
-    color: var(--muted); border-color: var(--border-glow); background: rgba(45,74,120,0.15);
-  }
-
-  .reach-bits { display: inline-flex; gap: 2px; vertical-align: middle; }
-  .reach-bit { width: 6px; height: 14px; }
-  .reach-bit.on  { background: var(--green); box-shadow: 0 0 4px var(--green); }
-  .reach-bit.off { background: var(--bg-2); border: 1px solid var(--border); }
-
-  .fun-fact {
-    background: linear-gradient(90deg, transparent, rgba(0,212,255,0.04) 20%, rgba(0,212,255,0.04) 80%, transparent);
-    border-left: 2px solid var(--cyan-dim);
-    border-right: 2px solid var(--amber-dim);
-    padding: 0.55rem 1.2rem;
-    margin-bottom: 1rem;
-    font-family: var(--mono);
-    font-size: 0.78rem;
-    color: var(--text);
-    letter-spacing: 0.02em;
-    display: flex;
-    align-items: center;
-    gap: 0.8rem;
-    min-height: 2.4rem;
-  }
-  .fun-fact .label {
-    font-family: var(--display);
-    font-size: 0.6rem;
-    font-weight: 700;
-    letter-spacing: 0.25em;
-    color: var(--amber);
-    text-transform: uppercase;
-    flex-shrink: 0;
-  }
-  .fun-fact .text {
-    color: var(--text);
-  }
-  .fun-fact .text .hl {
-    color: var(--cyan);
-    font-weight: 700;
-    text-shadow: 0 0 8px rgba(0,212,255,0.4);
-  }
-  .fun-fact .text .hl-amber {
-    color: var(--amber);
-    font-weight: 700;
-    text-shadow: 0 0 8px rgba(255,170,0,0.4);
-  }
-
-  #refresh-bar {
-    height: 2px;
-    background: var(--bg-2);
-    border: 1px solid var(--border);
-    margin-bottom: 1rem;
-    overflow: hidden;
-    position: relative;
-  }
-  #refresh-progress {
-    height: 100%;
-    background: linear-gradient(90deg, var(--cyan-dim), var(--cyan), var(--amber));
-    width: 0%;
-    transition: width linear;
-    box-shadow: 0 0 10px var(--cyan);
-  }
-
-  footer {
-    text-align: center;
-    margin-top: 3rem;
-    font-family: var(--display);
-    font-size: 0.65rem;
-    color: var(--muted);
-    letter-spacing: 0.3em;
-    text-transform: uppercase;
-  }
-
-  #loading {
-    text-align: center;
-    padding: 4rem;
-    color: var(--cyan);
-    font-family: var(--display);
-    font-size: 1.1rem;
-    letter-spacing: 0.4em;
-    text-transform: uppercase;
-    animation: blink 1.5s ease-in-out infinite;
-  }
-  #dashboard { display: none; }
-
-  .mission-patch svg path,
-  .mission-patch svg circle,
-  .mission-patch svg line { stroke: var(--cyan); fill: none; stroke-width: 1.5; }
-  .mission-patch svg .filled { fill: var(--amber); stroke: none; }
-</style>
-</head>
-<body>
-<div class="wrap">
-
-  <header>
-    <div class="mission-patch">
-      <svg viewBox="0 0 40 40">
-        <circle cx="20" cy="20" r="16"/>
-        <circle cx="20" cy="20" r="3" class="filled"/>
-        <line x1="20" y1="4" x2="20" y2="36"/>
-        <line x1="4" y1="20" x2="36" y2="20"/>
-        <path d="M 20 8 Q 32 20 20 32"/>
-        <path d="M 20 8 Q 8 20 20 32"/>
-      </svg>
-    </div>
-    <div class="header-text">
-      <div class="designation">Stratum 1 Time Authority</div>
-      <h1 id="h-hostname">{hostname}<span class="accent">.</span></h1>
-      <div class="subtitle">GPS-Disciplined NTP Reference</div>
-    </div>
-    <div class="local-time-block">
-      <div class="lt-label">Pacific <span id="lt-zone">PT</span></div>
-      <div class="lt-value">
-        <span id="lt-hms">--:--:--</span><span class="lt-ms" id="lt-ms">.000</span>
-      </div>
-      <div class="lt-date" id="lt-date">&mdash;</div>
-    </div>
-    <dl class="header-meta">
-      <dt>Node</dt><dd id="h-ip">—</dd>
-      <dt>Uptime</dt><dd id="h-uptime">—</dd>
-      <dt>Core Temp</dt><dd id="h-temp">—</dd>
-      <dt>Mission Time</dt><dd id="h-ts" style="font-size: 0.65rem">—</dd>
-      <dt>Status</dt><dd><span class="tx-indicator" id="tx-indicator">CHECKING</span></dd>
-    </dl>
-  </header>
-
-  <div id="refresh-bar"><div id="refresh-progress"></div></div>
-
-  <div id="loading">&#9658; ESTABLISHING TELEMETRY LINK</div>
-
-  <div id="dashboard">
-
-    <div class="banner ok" id="status-banner">
-      <span id="status-text">CHECKING...</span>
-      <span class="issues" id="status-issues"></span>
-    </div>
-
-    <div class="fun-fact" id="fun-fact">
-      <span class="label">DID YOU KNOW</span>
-      <span class="text" id="fun-fact-text">Computing telemetry...</span>
-    </div>
-
-    <div class="section-heading"><span class="marker">&#9658;</span><span>Orbital Tracking</span></div>
-
-    <div class="grid-2">
-      <div class="skyview-card" style="margin-bottom:0">
-        <div class="skyview-header">
-          <span class="title">&#9658; GPS Constellation View</span>
-          <span class="legend">
-            <span class="dot used"></span>Locked
-            <span class="dot visible"></span>Visible
-            <span id="skyview-meta" style="margin-left:1.2rem; color: var(--amber);">—</span>
-          </span>
-        </div>
-        <canvas id="skyview-canvas"></canvas>
-      </div>
-      <div class="card">
-        <div class="card-title">GPS Subsystem</div>
-        <div class="stat-row"><span class="stat-key">Fix Mode</span><span class="stat-val accent" id="g-fix">—</span></div>
-        <div class="stat-row"><span class="stat-key">Satellites Locked / Visible</span><span class="stat-val" id="g-sats">—</span></div>
-        <div class="stat-row"><span class="stat-key">Best SNR (dB-Hz)</span><span class="stat-val" id="g-snr">—</span></div>
-        <div class="stat-row"><span class="stat-key">HDOP</span><span class="stat-val" id="g-hdop">—</span></div>
-        <div class="stat-row"><span class="stat-key">PDOP</span><span class="stat-val" id="g-pdop">—</span></div>
-        <div class="stat-row"><span class="stat-key">Altitude</span><span class="stat-val" id="g-alt">—</span></div>
-        <div class="stat-row"><span class="stat-key">Time Since Lock</span><span class="stat-val good" id="g-fix-age">—</span></div>
-      </div>
-    </div>
-
-    <div class="section-heading"><span class="marker">&#9658;</span><span>Primary Telemetry</span></div>
-
-    <div class="grid-3">
-      <div class="card">
-        <div class="card-title">System Offset</div>
-        <div class="hero-stat">
-          <div class="val" id="h-sys-offset">—</div>
-          <div class="lbl">Last Offset</div>
-          <div class="sub" id="h-rms-offset">RMS —</div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-title">Stratum Level</div>
-        <div class="hero-stat">
-          <div class="val" id="h-stratum">—</div>
-          <div class="lbl">NTP Stratum</div>
-          <div class="sub" id="h-leap">Leap —</div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-title">Frequency Drift</div>
-        <div class="hero-stat">
-          <div class="val" id="h-freq">—</div>
-          <div class="lbl">Clock Offset</div>
-          <div class="sub" id="h-skew">Skew —</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="card full">
-        <div class="card-title">PPS Discipline (recent samples)</div>
-        <svg class="sparkline" id="pps-spark" preserveAspectRatio="none"></svg>
-        <div class="stat-row" style="margin-top:0.7rem"><span class="stat-key">Min</span><span class="stat-val good" id="pps-min">—</span></div>
-        <div class="stat-row"><span class="stat-key">Max</span><span class="stat-val warn" id="pps-max">—</span></div>
-        <div class="stat-row"><span class="stat-key">Range</span><span class="stat-val accent" id="pps-range">—</span></div>
-        <div class="stat-row"><span class="stat-key">Sample count</span><span class="stat-val" id="pps-count">—</span></div>
-        <div class="stat-row"><span class="stat-key">PPS IRQ Total</span><span class="stat-val amber" id="pps-irq">—</span></div>
-      </div>
-
-    <div class="section-heading"><span class="marker">&#9658;</span><span>System Telemetry</span></div>
-
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-title">Tracking Detail</div>
-        <div class="stat-row"><span class="stat-key">Reference ID</span><span class="stat-val accent" id="t-refid">—</span></div>
-        <div class="stat-row"><span class="stat-key">Ref Time (UTC)</span><span class="stat-val" id="t-reftime">—</span></div>
-        <div class="stat-row"><span class="stat-key">Update Interval</span><span class="stat-val" id="t-interval">—</span></div>
-        <div class="stat-row"><span class="stat-key">Root Delay</span><span class="stat-val good" id="t-rootdelay">—</span></div>
-        <div class="stat-row"><span class="stat-key">Root Dispersion</span><span class="stat-val" id="t-rootdisp">—</span></div>
-        <div class="stat-row"><span class="stat-key">Residual Freq</span><span class="stat-val" id="t-residfreq">—</span></div>
-        <div class="stat-row"><span class="stat-key">Activity</span><span class="stat-val" id="t-activity">—</span></div>
-      </div>
-
-      <div class="card">
-        <div class="card-title">Hardware Vitals</div>
-        <div class="stat-row"><span class="stat-key">Hostname</span><span class="stat-val accent" id="s-host">—</span></div>
-        <div class="stat-row"><span class="stat-key">IP Address</span><span class="stat-val" id="s-ip">—</span></div>
-        <div class="stat-row"><span class="stat-key">Core Temperature</span><span class="stat-val" id="s-temp">—</span></div>
-        <div class="stat-row"><span class="stat-key">Memory</span><span class="stat-val" id="s-mem">—</span></div>
-        <div class="stat-row"><span class="stat-key">Load Average</span><span class="stat-val" id="s-load">—</span></div>
-        <div class="stat-row"><span class="stat-key">System Uptime</span><span class="stat-val" id="s-uptime">—</span></div>
-        <div class="stat-row"><span class="stat-key">Isolated Cores</span><span class="stat-val amber" id="s-isolated">—</span></div>
-        <div class="stat-row"><span class="stat-key">Leap Data Expiry</span><span class="stat-val" id="s-leap">—</span></div>
-      </div>
-    </div>
-
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-title">CPU Core Utilization</div>
-        <div id="cpu-cores">—</div>
-      </div>
-      <div class="card">
-        <div class="card-title">NTP Service Statistics</div>
-        <div class="stat-row"><span class="stat-key">NTP Packets Received</span><span class="stat-val good" id="ss-rx">—</span></div>
-        <div class="stat-row"><span class="stat-key">NTP Packets Dropped</span><span class="stat-val" id="ss-drop">—</span></div>
-        <div class="stat-row"><span class="stat-key">Command Packets Received</span><span class="stat-val" id="ss-cmd-rx">—</span></div>
-        <div class="stat-row"><span class="stat-key">Command Packets Dropped</span><span class="stat-val" id="ss-cmd-drop">—</span></div>
-        <div class="stat-row"><span class="stat-key">Client Log Records Dropped</span><span class="stat-val" id="ss-clog">—</span></div>
-      </div>
-    </div>
-
-    <div class="section-heading"><span class="marker">&#9658;</span><span>Global Reference</span></div>
-
-    <div class="card full">
-      <div class="card-title">Authoritative Time (Disseminated From This Node)</div>
-      <div class="world-clock" id="world-clock">—</div>
-    </div>
-
-    <div class="section-heading"><span class="marker">&#9658;</span><span>Source Network</span></div>
-
-    <div class="card full">
-      <div class="card-title">Time Sources</div>
-      <div class="tbl-wrap">
-        <table>
-          <thead><tr>
-            <th>State</th><th>Source</th><th>Stratum</th><th>Poll</th>
-            <th>Reach</th><th>Last Rx</th><th>Offset</th><th>Margin</th>
-          </tr></thead>
-          <tbody id="sources-body"><tr><td colspan="8" style="color:var(--muted);padding:1rem">Loading...</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="card full">
-      <div class="card-title">Source Statistics</div>
-      <div class="tbl-wrap">
-        <table>
-          <thead><tr>
-            <th>Source</th><th>Samples (NP/NR)</th><th>Span</th>
-            <th>Freq Skew</th><th>Std Dev</th><th>Offset</th>
-          </tr></thead>
-          <tbody id="stats-body"><tr><td colspan="6" style="color:var(--muted);padding:1rem">Loading...</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="card full">
-      <div class="card-title">Connected Clients</div>
-      <div class="tbl-wrap">
-        <table>
-          <thead><tr><th>Client</th><th>NTP Requests</th><th>Drops</th><th>Last Query</th></tr></thead>
-          <tbody id="clients-body"><tr><td colspan="4" style="color:var(--muted);padding:1rem">Loading...</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-  </div>
-
-  <footer>
-    &#9670; GPS-Disciplined Stratum 1 &#9670; NTPv4 Compliant &#9670; Refreshing every 5 seconds &#9670;
-    <div id="visitor-stats" style="margin-top:0.6rem;font-size:0.55rem;color:var(--muted);letter-spacing:0.2em;opacity:0.6">
-      <span id="visitor-current">&mdash;</span> viewing now &#9670; <span id="visitor-total">&mdash;</span> unique all-time
-    </div>
-  </footer>
-
-</div>
-
-<script>
-const REFRESH_S = 5;
-// Set by render() from the server's own record of the GPS fix; the ticker
-// below only adds the time since that snapshot arrived.
-let fixInfo = null;
-let lastGoodAt = null;   // performance.now() of the last successful poll
-let linkLost = false;
-let fetching = false;
-
-function reachBits(octal) {
-  let dec = parseInt(octal, 8);
-  if (isNaN(dec)) return esc(octal);
-  let html = '<span class="reach-bits">';
-  for (let i = 7; i >= 0; i--) {
-    html += `<span class="reach-bit ${(dec >> i) & 1 ? 'on' : 'off'}"></span>`;
-  }
-  return html + '</span>';
-}
-
-// Escape text before it goes into innerHTML. Everything shown comes from
-// chronyc/gpsd output, but those include names that remote hosts control.
-function esc(v) {
-  return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  })[c]);
-}
-
-function stateClass(state) { return 'state-' + (state || '').replace(/ /g, '-'); }
-
-function setText(id, val) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = (val === undefined || val === null || val === '') ? '\u2014' : val;
-}
-
-function colorizeOffset(val, id) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.textContent = val;
-  const m = val && val.match(/([-\d.]+)\s*(ns|us|ms|s|seconds)?/);
-  if (m) {
-    const n = Math.abs(parseFloat(m[1]));
-    const unit = m[2];
-    let ns = n;
-    if (unit === 'us') ns = n * 1000;
-    else if (unit === 'ms') ns = n * 1e6;
-    else if (unit === 's' || unit === 'seconds') ns = n * 1e9;
-    el.className = 'stat-val ' + (ns < 10000 ? 'good' : ns < 1e6 ? 'accent' : 'bad');
-  }
-}
-
-function formatDuration(seconds) {
-  if (seconds == null || seconds < 0) return '\u2014';
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  if (d > 0) return `${d}d ${h}h ${m}m`;
-  if (h > 0) return `${h}h ${m}m ${s}s`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-}
-
-function formatSecondsAsHuman(s) {
-  if (s == null) return '\u2014';
-  const abs = Math.abs(s);
-  if (abs < 1e-6) return (s * 1e9).toFixed(1) + ' ns';
-  if (abs < 1e-3) return (s * 1e6).toFixed(2) + ' \u00b5s';
-  if (abs < 1)    return (s * 1e3).toFixed(3) + ' ms';
-  return s.toFixed(3) + ' s';
-}
-
-const canvas = document.getElementById('skyview-canvas');
-const ctx = canvas.getContext('2d');
-let satsCurrent = [];
-let satsAnimated = [];
-let radarAngle = 0;
-
-// Setting canvas.width reallocates and clears the canvas, so do it only when
-// the size really changes, and keep the size for drawSky() to reuse.
-let canvasW = 0;
-let canvasH = 0;
-function resizeCanvas() {
-  const dpr = window.devicePixelRatio || 1;
-  const rect = canvas.getBoundingClientRect();
-  const pxW = Math.round(rect.width * dpr);
-  const pxH = Math.round(rect.height * dpr);
-  canvasW = rect.width;
-  canvasH = rect.height;
-  if (canvas.width !== pxW || canvas.height !== pxH) {
-    canvas.width = pxW;
-    canvas.height = pxH;
-  }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-}
-window.addEventListener('resize', resizeCanvas);
-if (typeof ResizeObserver === 'function') {
-  new ResizeObserver(resizeCanvas).observe(canvas);
-}
-
-function projectSat(el, az, w, h) {
-  const cx = w / 2;
-  const cy = h / 2;
-  const r = Math.min(w, h) / 2 - 28;
-  const elRad = (el || 0) * Math.PI / 180;
-  const azRad = (az || 0) * Math.PI / 180;
-  const dist = r * (1 - Math.sin(elRad));
-  const x = cx + dist * Math.sin(azRad);
-  const y = cy - dist * Math.cos(azRad);
-  return { x, y };
-}
-
-function drawSky() {
-  const w = canvasW;
-  const h = canvasH;
-  ctx.clearRect(0, 0, w, h);
-
-  const cx = w / 2;
-  const cy = h / 2;
-  const r = Math.min(w, h) / 2 - 28;
-
-  if (r <= 0) return;
-
-  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
-  grad.addColorStop(0, 'rgba(0,212,255,0.04)');
-  grad.addColorStop(1, 'rgba(0,212,255,0)');
-  ctx.fillStyle = grad;
-  ctx.beginPath();
-  ctx.arc(cx, cy, r, 0, 2 * Math.PI);
-  ctx.fill();
-
-  if (typeof ctx.createConicGradient === 'function') {
-    const sweepGrad = ctx.createConicGradient(radarAngle, cx, cy);
-    sweepGrad.addColorStop(0, 'rgba(0,212,255,0.18)');
-    sweepGrad.addColorStop(0.1, 'rgba(0,212,255,0.0)');
-    sweepGrad.addColorStop(1, 'rgba(0,212,255,0.0)');
-    ctx.fillStyle = sweepGrad;
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, 2 * Math.PI);
-    ctx.fill();
-  }
-
-  ctx.strokeStyle = 'rgba(45,74,120,0.4)';
-  ctx.lineWidth = 1;
-  for (const elev of [0, 30, 60]) {
-    const ringR = r * (1 - elev / 90);
-    ctx.beginPath();
-    ctx.arc(cx, cy, ringR, 0, 2 * Math.PI);
-    ctx.stroke();
-  }
-
-  ctx.setLineDash([3, 4]);
-  ctx.beginPath();
-  ctx.moveTo(cx - r, cy); ctx.lineTo(cx + r, cy);
-  ctx.moveTo(cx, cy - r); ctx.lineTo(cx, cy + r);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  ctx.fillStyle = '#00d4ff';
-  ctx.font = "bold 11px 'Orbitron', sans-serif";
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('N', cx, cy - r - 12);
-  ctx.fillText('S', cx, cy + r + 12);
-  ctx.fillText('E', cx + r + 12, cy);
-  ctx.fillText('W', cx - r - 12, cy);
-
-  ctx.fillStyle = '#4a6080';
-  ctx.font = "9px 'Space Mono', monospace";
-  ctx.fillText('30\u00b0', cx + 4, cy - r * 0.667 + 2);
-  ctx.fillText('60\u00b0', cx + 4, cy - r * 0.333 + 2);
-
-  for (const sat of satsAnimated) {
-    if (sat.el == null || sat.az == null) continue;
-    const { x, y } = projectSat(sat.el, sat.az, w, h);
-    const used = sat.used;
-    const ss = sat.ss || 0;
-
-    if (used) {
-      ctx.strokeStyle = 'rgba(0,255,136,0.4)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.arc(x, y, 11, 0, 2 * Math.PI);
-      ctx.stroke();
-
-      ctx.shadowBlur = 14;
-      ctx.shadowColor = '#00ff88';
-      ctx.fillStyle = '#00ff88';
-      ctx.beginPath();
-      ctx.arc(x, y, 4 + Math.min(ss / 12, 4), 0, 2 * Math.PI);
-      ctx.fill();
-      ctx.shadowBlur = 0;
-
-      ctx.strokeStyle = 'rgba(0,255,136,0.8)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(x - 14, y); ctx.lineTo(x - 9, y);
-      ctx.moveTo(x + 9, y);  ctx.lineTo(x + 14, y);
-      ctx.moveTo(x, y - 14); ctx.lineTo(x, y - 9);
-      ctx.moveTo(x, y + 9);  ctx.lineTo(x, y + 14);
-      ctx.stroke();
-    } else {
-      ctx.fillStyle = ss > 25 ? 'rgba(192,208,224,0.7)' : 'rgba(74,96,128,0.7)';
-      ctx.beginPath();
-      ctx.arc(x, y, 2.5, 0, 2 * Math.PI);
-      ctx.fill();
-    }
-
-    ctx.fillStyle = used ? '#00ff88' : 'rgba(74,96,128,0.8)';
-    ctx.font = "bold 10px 'Space Mono', monospace";
-    ctx.fillText(sat.prn, x, y + (used ? 22 : 12));
-  }
-
-  ctx.strokeStyle = '#ffaa00';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.arc(cx, cy, 6, 0, 2 * Math.PI);
-  ctx.moveTo(cx - 10, cy); ctx.lineTo(cx + 10, cy);
-  ctx.moveTo(cx, cy - 10); ctx.lineTo(cx, cy + 10);
-  ctx.stroke();
-  ctx.fillStyle = '#ffaa00';
-  ctx.beginPath();
-  ctx.arc(cx, cy, 1.5, 0, 2 * Math.PI);
-  ctx.fill();
-}
-
-// The sky changes slowly, so 20 frames a second is plenty; the sweep angle
-// follows the clock so its speed does not depend on the frame rate.
-const SKY_FRAME_MS = 50;
-let lastSkyDraw = 0;
-function animateSats(now) {
-  requestAnimationFrame(animateSats);
-  if (now - lastSkyDraw < SKY_FRAME_MS) return;
-  lastSkyDraw = now;
-  radarAngle = (now / 1000) * 0.72;
-  for (let i = 0; i < satsAnimated.length; i++) {
-    const sat = satsAnimated[i];
-    const target = satsCurrent.find(s => s.prn === sat.prn);
-    if (target) {
-      if (target.el == null || target.az == null || sat.el == null || sat.az == null) {
-        // Position unknown on one side: nothing to ease between.
-        sat.el = target.el;
-        sat.az = target.az;
-      } else {
-        const dEl = target.el - sat.el;
-        // Take the short way round the compass (359 -> 1 is +2, not -358).
-        const dAz = ((target.az - sat.az + 540) % 360) - 180;
-        sat.el += dEl * 0.17;
-        sat.az = (sat.az + dAz * 0.17 + 360) % 360;
-      }
-      sat.ss = target.ss;
-      sat.used = target.used;
-    }
-  }
-  drawSky();
-}
-
-function updateSats(newSats) {
-  for (const ns of newSats) {
-    const existing = satsAnimated.find(s => s.prn === ns.prn);
-    if (!existing) {
-      satsAnimated.push({...ns});
-    }
-  }
-  satsAnimated = satsAnimated.filter(s => newSats.find(n => n.prn === s.prn));
-  satsCurrent = newSats;
-}
-
-requestAnimationFrame(animateSats);
-
-function drawSparkline(values) {
-  const svg = document.getElementById('pps-spark');
-  while (svg.firstChild) svg.removeChild(svg.firstChild);
-  if (!values || values.length === 0) {
-    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    text.setAttribute('x', '50%');
-    text.setAttribute('y', '50%');
-    text.setAttribute('text-anchor', 'middle');
-    text.setAttribute('fill', '#4a6080');
-    text.setAttribute('font-family', 'Space Mono');
-    text.setAttribute('font-size', '10');
-    text.textContent = 'NO DATA - enable: log refclocks in chrony.conf';
-    svg.appendChild(text);
-    return;
-  }
-  const rect = svg.getBoundingClientRect();
-  const w = rect.width;
-  const h = rect.height;
-  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
-
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const range = max - min || 1;
-  const padding = 6;
-  const usableH = h - 2 * padding;
-
-  for (let i = 1; i < 4; i++) {
-    const y = padding + (usableH * i / 4);
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    line.setAttribute('x1', 0);
-    line.setAttribute('x2', w);
-    line.setAttribute('y1', y);
-    line.setAttribute('y2', y);
-    line.setAttribute('stroke', 'rgba(45,74,120,0.3)');
-    line.setAttribute('stroke-dasharray', '2,3');
-    svg.appendChild(line);
-  }
-
-  if (min < 0 && max > 0) {
-    const zeroY = padding + usableH * (max / range);
-    const zeroLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    zeroLine.setAttribute('x1', 0);
-    zeroLine.setAttribute('x2', w);
-    zeroLine.setAttribute('y1', zeroY);
-    zeroLine.setAttribute('y2', zeroY);
-    zeroLine.setAttribute('stroke', '#ffaa00');
-    zeroLine.setAttribute('stroke-dasharray', '4,3');
-    zeroLine.setAttribute('opacity', '0.4');
-    svg.appendChild(zeroLine);
-  }
-
-  const stepX = w / (values.length - 1 || 1);
-  let pathStr = `M 0 ${h}`;
-  values.forEach((v, i) => {
-    const x = i * stepX;
-    const y = padding + usableH * (1 - (v - min) / range);
-    pathStr += ` L ${x} ${y}`;
-  });
-  pathStr += ` L ${w} ${h} Z`;
-
-  const fillGrad = `<defs><linearGradient id="ppsGrad" x1="0" x2="0" y1="0" y2="1">
-    <stop offset="0%" stop-color="#00d4ff" stop-opacity="0.3"/>
-    <stop offset="100%" stop-color="#00d4ff" stop-opacity="0"/>
-  </linearGradient></defs>`;
-  svg.insertAdjacentHTML('afterbegin', fillGrad);
-
-  const fill = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  fill.setAttribute('d', pathStr);
-  fill.setAttribute('fill', 'url(#ppsGrad)');
-  svg.appendChild(fill);
-
-  let d = '';
-  values.forEach((v, i) => {
-    const x = i * stepX;
-    const y = padding + usableH * (1 - (v - min) / range);
-    d += (i === 0 ? 'M' : 'L') + x + ',' + y + ' ';
-  });
-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  path.setAttribute('d', d);
-  path.setAttribute('fill', 'none');
-  path.setAttribute('stroke', '#00d4ff');
-  path.setAttribute('stroke-width', '1.5');
-  path.setAttribute('filter', 'drop-shadow(0 0 4px rgba(0,212,255,0.6))');
-  svg.appendChild(path);
-
-  const lastX = (values.length - 1) * stepX;
-  const lastY = padding + usableH * (1 - (values[values.length - 1] - min) / range);
-  const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-  dot.setAttribute('cx', lastX);
-  dot.setAttribute('cy', lastY);
-  dot.setAttribute('r', '3.5');
-  dot.setAttribute('fill', '#00d4ff');
-  dot.setAttribute('filter', 'drop-shadow(0 0 6px #00d4ff)');
-  svg.appendChild(dot);
-}
-
-const TIMEZONES = [
-  { city: 'Los Angeles', tz: 'America/Los_Angeles' },
-  { city: 'New York',    tz: 'America/New_York' },
-  { city: 'London',      tz: 'Europe/London' },
-  { city: 'Berlin',      tz: 'Europe/Berlin' },
-  { city: 'Tokyo',       tz: 'Asia/Tokyo' },
-  { city: 'Sydney',      tz: 'Australia/Sydney' },
-  { city: 'UTC',         tz: 'UTC' },
-];
-
-function updateWorldClock() {
-  const wc = document.getElementById('world-clock');
-  const now = new Date();
-  wc.innerHTML = TIMEZONES.map(t => {
-    const time = now.toLocaleTimeString('en-US', { timeZone: t.tz, hour12: false });
-    const date = now.toLocaleDateString('en-US', { timeZone: t.tz, month: 'short', day: 'numeric' });
-    return `<div class="tz-cell">
-      <div class="city">${t.city}</div>
-      <div class="time">${time}</div>
-      <div class="date">${date}</div>
-    </div>`;
-  }).join('');
-}
-setInterval(updateWorldClock, 1000);
-
-// Pacific time header clock - sub-second precision, smooth update via rAF.
-// Browser Date.now() is millisecond-resolution at best (timer precision is
-// intentionally reduced by browsers), so 3 decimal places is the honest ceiling.
-const _ltHms = document.getElementById('lt-hms');
-const _ltMs = document.getElementById('lt-ms');
-const _ltDate = document.getElementById('lt-date');
-const _ltZone = document.getElementById('lt-zone');
-const _ltHmsFmt = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'America/Los_Angeles',
-  hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'
-});
-const _ltDateFmt = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'America/Los_Angeles',
-  weekday: 'short', month: 'short', day: '2-digit', year: 'numeric'
-});
-const _ltZoneFmt = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'America/Los_Angeles', timeZoneName: 'short'
-});
-function _ltGetAbbrev(d) {
-  const parts = _ltZoneFmt.formatToParts(d);
-  const p = parts.find(x => x.type === 'timeZoneName');
-  return p ? p.value : 'PT';
-}
-function updatePacificClock() {
-  const now = new Date();
-  // toLocaleTimeString with fractionalSecondDigits respects the timezone correctly,
-  // and we render hh:mm:ss separately from ms to keep the ms in its own color.
-  const hms = _ltHmsFmt.format(now).replace(/^24/, '00'); // normalize midnight
-  const ms = String(now.getMilliseconds()).padStart(3, '0');
-  if (_ltHms.textContent !== hms) _ltHms.textContent = hms;
-  _ltMs.textContent = '.' + ms;
-  // Date and zone change infrequently. Update them once a second is plenty.
-  if (!window._ltLastSec || window._ltLastSec !== hms) {
-    window._ltLastSec = hms;
-    _ltDate.textContent = _ltDateFmt.format(now);
-    _ltZone.textContent = _ltGetAbbrev(now);
-  }
-  requestAnimationFrame(updatePacificClock);
-}
-requestAnimationFrame(updatePacificClock);
-
-function updateFixAge() {
-  const el = document.getElementById('g-fix-age');
-  if (!el) return;
-  if (!fixInfo || linkLost) {
-    el.textContent = '\u2014';
-    el.className = 'stat-val';
-    return;
-  }
-  const sinceFetch = (performance.now() - fixInfo.fetchedAt) / 1000;
-  if (fixInfo.lockedS != null) {
-    // "> " when the fix was already there the first time the server looked.
-    el.textContent = (fixInfo.exact ? '' : '> ') + formatDuration(fixInfo.lockedS + sinceFetch);
-    el.className = 'stat-val good';
-  } else if (fixInfo.lostS != null) {
-    el.textContent = 'no fix for ' + formatDuration(fixInfo.lostS + sinceFetch);
-    el.className = 'stat-val bad';
-  } else {
-    el.textContent = 'no fix';
-    el.className = 'stat-val bad';
-  }
-}
-
-// When polls fail, say so where the status is, and how old the data is.
-function showLinkLost() {
-  linkLost = true;
-  const banner = document.getElementById('status-banner');
-  banner.classList.remove('ok', 'degraded');
-  banner.classList.add('fault');
-  setText('status-text', '\u2715 TELEMETRY LINK LOST');
-  setText('status-issues', lastGoodAt == null
-    ? 'no data received yet'
-    : 'showing data from ' + formatDuration((performance.now() - lastGoodAt) / 1000) + ' ago');
-  const tx = document.getElementById('tx-indicator');
-  tx.textContent = 'NO LINK';
-  tx.classList.add('down');
-  updateFixAge();
-}
-
-setInterval(() => {
-  if (linkLost) showLinkLost(); else updateFixAge();
-}, 1000);
-
-function render(d) {
-  const { tracking: t, sources, sourcestats, clients, serverstats: ss, activity,
-          gps, cpu_cores, pps_irq, pps_history, system: s, health } = d;
-
-  setText('h-hostname', s.hostname);
-  setText('h-ip', s.ip);
-  setText('h-uptime', s.uptime);
-  setText('h-temp', s.temperature);
-  setText('h-ts', s.timestamp);
-
-  // Fun fact rotation - throttled independent of data refresh
-  if (!window._lastFactTime || Date.now() - window._lastFactTime > 15000) {
-    document.getElementById('fun-fact-text').innerHTML = generateFunFact(d);
-    window._lastFactTime = Date.now();
-  }
-
-  const banner = document.getElementById('status-banner');
-  banner.classList.remove('ok', 'degraded', 'fault');
-  if (health.status === 'OK') {
-    banner.classList.add('ok');
-    setText('status-text', '\u25C6 NOMINAL \u25B8 LOCKED & SERVING');
-  } else if (health.status === 'DEGRADED') {
-    banner.classList.add('degraded');
-    setText('status-text', '\u26A0 DEGRADED');
-  } else {
-    banner.classList.add('fault');
-    setText('status-text', '\u2715 FAULT');
-  }
-  setText('status-issues', health.issues.length ? health.issues.join('  \u25B8  ') : '');
-
-  if (gps.satellites) {
-    updateSats(gps.satellites);
-    setText('skyview-meta', `${gps.sats_used || 0} LOCKED \u25C6 ${gps.sats_visible || 0} VISIBLE`);
-  }
-
-  setText('g-fix', gps.fix_mode);
-  setText('g-sats', `${gps.sats_used || 0} / ${gps.sats_visible || 0}`);
-  setText('g-snr', gps.best_snr || '\u2014');
-  setText('g-hdop', gps.hdop != null ? gps.hdop.toFixed(2) : '\u2014');
-  setText('g-pdop', gps.pdop != null ? gps.pdop.toFixed(2) : '\u2014');
-  if (gps.lat != null && gps.lon != null) {
-    setText('g-pos', `${gps.lat.toFixed(5)}\u00b0, ${gps.lon.toFixed(5)}\u00b0`);
-  } else {
-    setText('g-pos', '\u2014');
-  }
-  setText('g-alt', gps.alt != null ? gps.alt.toFixed(1) + ' m' : '\u2014');
-
-  // Durations are worked out against the server's clock (s.epoch), so a wrong
-  // clock on the viewer's machine does not change them.
-  fixInfo = {
-    lockedS: gps.has_fix && gps.fix_since != null ? s.epoch - gps.fix_since : null,
-    exact: !!gps.fix_since_exact,
-    lostS: gps.last_fix != null ? s.epoch - gps.last_fix : null,
-    fetchedAt: performance.now(),
-  };
-  updateFixAge();
-
-  const tx = document.getElementById('tx-indicator');
-  tx.textContent = health.status === 'FAULT' ? 'NOT SYNCED' : 'TRANSMITTING';
-  tx.classList.toggle('down', health.status === 'FAULT');
-
-  colorizeOffset(t.last_offset, 'h-sys-offset');
-  setText('h-rms-offset', 'RMS ' + t.rms_offset);
-  setText('h-stratum', t.stratum);
-  setText('h-leap', 'Leap ' + t.leap_status);
-  setText('h-freq', t.freq_error);
-  setText('h-skew', 'Skew ' + t.skew);
-
-  setText('t-refid', t.reference_id);
-  setText('t-reftime', t.ref_time);
-  setText('t-interval', t.update_interval);
-  setText('t-rootdelay', t.root_delay);
-  setText('t-rootdisp', t.root_dispersion);
-  setText('t-residfreq', t.residual_freq);
-  const actStr = Object.entries(activity).map(([k, v]) => `${v} ${k}`).join(' \u25B8 ');
-  setText('t-activity', actStr || '\u2014');
-
-  setText('s-host', s.hostname);
-  setText('s-ip', s.ip);
-  setText('s-temp', s.temperature);
-  setText('s-mem', s.memory);
-  setText('s-load', s.loadavg);
-  setText('s-uptime', s.uptime);
-  setText('s-isolated', s.isolated_cpus);
-  setText('s-leap', d.next_leap || 'no scheduled leap');
-
-  const ccDiv = document.getElementById('cpu-cores');
-  const isolatedSet = new Set();
-  if (s.isolated_cpus && s.isolated_cpus !== 'none' && s.isolated_cpus !== '\u2014') {
-    s.isolated_cpus.split(',').forEach(part => {
-      if (part.includes('-')) {
-        const [a, b] = part.split('-').map(Number);
-        for (let i = a; i <= b; i++) isolatedSet.add('cpu' + i);
-      } else {
-        isolatedSet.add('cpu' + part.trim());
-      }
-    });
-  }
-  ccDiv.innerHTML = cpu_cores.map(c => {
-    const isIso = isolatedSet.has(c.core);
-    return `<div class="core-bar">
-      <span class="label ${isIso ? 'isolated' : ''}">${c.core.toUpperCase()}${isIso ? ' \u25C6' : ''}</span>
-      <div class="track"><div class="fill ${isIso ? 'isolated' : ''}" style="width:${c.usage}%"></div></div>
-      <span class="pct">${c.usage}%</span>
-    </div>`;
-  }).join('') + (isolatedSet.size > 0 ? '<div style="font-size:0.62rem;color:var(--magenta);margin-top:0.7rem;letter-spacing:0.1em;">\u25C6 ISOLATED CORE \u25C6</div>' : '');
-
-  setText('ss-rx', Number(ss.ntp_packets_received).toLocaleString());
-  setText('ss-drop', ss.ntp_packets_dropped);
-  setText('ss-cmd-rx', Number(ss.command_packets_received).toLocaleString());
-  setText('ss-cmd-drop', ss.command_packets_dropped);
-  setText('ss-clog', ss.client_log_records);
-
-  if (pps_history && pps_history.length > 0) {
-    drawSparkline(pps_history);
-    const min = Math.min(...pps_history);
-    const max = Math.max(...pps_history);
-    setText('pps-min', formatSecondsAsHuman(min));
-    setText('pps-max', formatSecondsAsHuman(max));
-    setText('pps-range', formatSecondsAsHuman(max - min));
-    setText('pps-count', pps_history.length);
-  } else {
-    drawSparkline([]);
-    setText('pps-min', '\u2014');
-    setText('pps-max', '\u2014');
-    setText('pps-range', '\u2014');
-    setText('pps-count', '0');
-  }
-  setText('pps-irq', pps_irq.total ? pps_irq.total.toLocaleString() : '\u2014');
-
-  const sb = document.getElementById('sources-body');
-  if (sources.length === 0) {
-    sb.innerHTML = '<tr><td colspan="8" style="color:var(--muted);padding:1rem">No sources</td></tr>';
-  } else {
-    sb.innerHTML = sources.map(src => {
-      return `
-      <tr>
-        <td><span class="state-badge ${esc(stateClass(src.state))}">${esc(src.state)}</span></td>
-        <td>${esc(src.name)}</td>
-        <td>${esc(src.stratum)}</td>
-        <td>${esc(src.poll)}</td>
-        <td>${reachBits(src.reach)}</td>
-        <td>${esc(src.last_rx)}</td>
-        <td>${esc(src.last_sample_offset)}</td>
-        <td>${esc(src.margin)}</td>
-      </tr>`;
-    }).join('');
-  }
-
-  const stb = document.getElementById('stats-body');
-  if (sourcestats.length === 0) {
-    stb.innerHTML = '<tr><td colspan="6" style="color:var(--muted);padding:1rem">No stats</td></tr>';
-  } else {
-    stb.innerHTML = sourcestats.map(r => `
-      <tr>
-        <td>${esc(r.name)}</td>
-        <td>${esc(r.np)} / ${esc(r.nr)}</td>
-        <td>${esc(r.span)}</td>
-        <td>${esc(r.freq_skew)}</td>
-        <td>${esc(r.std_dev)}</td>
-        <td>${esc(r.offset)}</td>
-      </tr>`).join('');
-  }
-
-  const cb = document.getElementById('clients-body');
-  if (clients.length === 0) {
-    cb.innerHTML = '<tr><td colspan="4" style="color:var(--muted);padding:1rem">No clients yet</td></tr>';
-  } else {
-    cb.innerHTML = clients.map(c => `
-      <tr>
-        <td>${esc(c.host)}</td>
-        <td>${esc(c.ntp)}</td>
-        <td>${esc(c.drops)}</td>
-        <td>${esc(c.last_query)}</td>
-      </tr>`).join('');
-  }
-
-  if (d.visitors) {
-    setText('visitor-current', d.visitors.current);
-    setText('visitor-total', d.visitors.total_unique.toLocaleString());
-  }
-}
-
-
-function generateFunFact(d) {
-  const rawOffset = d.tracking.last_offset || '';
-  const offsetStr = esc(rawOffset);
-  const m = rawOffset.match(/([-\d.]+)\s*(ns|us|ms|s|seconds)?/);
-  let ns = 1000;
-  if (m) {
-    const n = Math.abs(parseFloat(m[1]));
-    const unit = m[2];
-    ns = n;
-    if (unit === 'us') ns = n * 1000;
-    else if (unit === 'ms') ns = n * 1e6;
-    else if (unit === 's' || unit === 'seconds') ns = n * 1e9;
-  }
-  const seconds = ns / 1e9;
-  const speedOfLight = 299792458;
-  const lightDistance = seconds * speedOfLight;
-  const soundSpeed = 343;
-  const soundDistance = seconds * soundSpeed;
-
-  const fmtMeters = (m) => {
-    if (m < 0.001) return (m * 1000).toFixed(2) + ' mm';
-    if (m < 1)     return (m * 100).toFixed(1) + ' cm';
-    if (m < 1000)  return m.toFixed(2) + ' m';
-    return (m / 1000).toFixed(2) + ' km';
-  };
-
-  const sats = d.gps.sats_used || 0;
-  const visible = d.gps.sats_visible || 0;
-  const alt = d.gps.alt;
-  const ntpRx = parseInt(d.serverstats.ntp_packets_received) || 0;
-  const uptime = esc(d.system.uptime || '');
-  const stratum = esc(d.tracking.stratum);
-  const freq = parseFloat((d.tracking.freq_error || '0').replace(/[^-\d.]/g, '')) || 0;
-  const skew = parseFloat((d.tracking.skew || '0').replace(/[^-\d.]/g, '')) || 0;
-  const ppsTotal = (d.pps_irq && d.pps_irq.total) || 0;
-  const temp = esc(d.system.temperature || '');
-  const rootDelay = d.tracking.root_delay || '';
-
-  const facts = [
-    // Light & sound at your offset
-    `Your last offset of <span class="hl">${offsetStr}</span> is the time it takes light to travel <span class="hl-amber">${fmtMeters(lightDistance)}</span> in a vacuum.`,
-    `Sound travels just <span class="hl-amber">${fmtMeters(soundDistance)}</span> in the time of your current offset of <span class="hl">${offsetStr}</span>.`,
-    `In the time of your offset, an electron travels less than <span class="hl-amber">${fmtMeters(lightDistance * 0.05)}</span> through copper wire (signals propagate at ~5% of c).`,
-    `Light travels <span class="hl">~30 cm in 1 nanosecond</span>. Your last offset corresponds to about <span class="hl-amber">${fmtMeters(lightDistance)}</span> of light travel.`,
-    `Your offset of <span class="hl">${offsetStr}</span> is roughly the time it takes a photon to travel <span class="hl-amber">${fmtMeters(lightDistance)}</span>. A human hair is 80 microns thick.`,
-    `An optical fiber transmits light at about <span class="hl">2/3 the vacuum speed of light</span>. Your offset equates to ${fmtMeters(lightDistance * 0.67)} of fiber travel.`,
-    `In your current offset, a radio wave at 2.4 GHz Wi-Fi completes only <span class="hl-amber">${Math.max(1, Math.floor(2.4e9 * ns / 1e9)).toLocaleString()}</span> oscillations.`,
-    `A bullet travels at roughly <span class="hl">760 m/s</span>. In the duration of your offset it would move just <span class="hl-amber">${fmtMeters(seconds * 760)}</span>.`,
-    `Earth orbits the Sun at <span class="hl">~30 km/s</span>. In your offset duration, Earth moved <span class="hl-amber">${fmtMeters(seconds * 30000)}</span> along its orbit.`,
-    `The Moon recedes from Earth at <span class="hl">38 mm/year</span>. Your offset is so brief the Moon moved <span class="hl-amber">${(38 * seconds / 31557600 * 1e9).toExponential(2)} nm</span> in that time.`,
-
-    // NTP precision comparisons
-    `A standard NTP query exchange takes around <span class="hl">10 ms</span>. Your server is roughly <span class="hl-amber">${(10000000 / Math.max(ns, 1)).toFixed(0)}x</span> more precise than the round trip.`,
-    `A typical home internet connection has <span class="hl">5-30 ms latency</span> to its NTP source. Your local server delivers time orders of magnitude tighter.`,
-    `Public NTP pool servers offer accuracy around <span class="hl">1-50 ms</span>. Yours is better by a factor of <span class="hl-amber">${(1000000 / Math.max(ns / 1000, 1)).toFixed(0)}x</span>.`,
-    `Windows' built-in w32time targets <span class="hl">~1 second accuracy</span> by default. Your stratum 1 box is roughly <span class="hl-amber">${(1e9 / Math.max(ns, 1)).toExponential(1)}x</span> tighter.`,
-    `Cloudflare's NTP service publishes about <span class="hl">200 microsecond</span> accuracy. Yours beats that by <span class="hl-amber">${(200000 / Math.max(ns / 1000, 1)).toFixed(0)}x</span>.`,
-    `Apple's time.apple.com is stratum 2. You're <span class="hl">one level closer to the source</span>, with no upstream server between you and atomic time.`,
-
-    // GPS / orbital
-    `Right now <span class="hl">${sats} of ${visible}</span> visible satellites are being used to discipline this clock. Each one is roughly <span class="hl-amber">20,200 km</span> overhead, moving at <span class="hl-amber">14,000 km/h</span>.`,
-    `GPS satellite atomic clocks tick about <span class="hl">38 microseconds per day</span> faster than ours due to relativity. Your offset is <span class="hl-amber">${(38000 / Math.max(ns / 1000, 1)).toFixed(0)}x</span> better than that drift.`,
-    `Each GPS satellite carries <span class="hl">two rubidium and two cesium atomic clocks</span>, kept in agreement and continuously monitored by ground control.`,
-    `GPS satellites orbit Earth twice per sidereal day, at an altitude of <span class="hl">20,200 km</span>. Their signals reach you about <span class="hl-amber">67 ms</span> after transmission.`,
-    `The GPS constellation has <span class="hl">31 operational satellites</span> currently. You can typically see 8-12 above the horizon at any time.`,
-    `A GPS satellite must broadcast its position to within <span class="hl">a few meters</span> for your fix to work. That requires its onboard clocks to agree to within <span class="hl-amber">~10 ns</span>.`,
-    `GPS time started at <span class="hl">midnight UTC, January 6, 1980</span>. It has not had a leap second adjustment since, which is why GPS time is now 18 seconds ahead of UTC.`,
-    `Your altitude reading of <span class="hl">${alt != null ? alt.toFixed(0) + ' m' : 'unknown'}</span> comes from triangulating signals that left GPS satellites about <span class="hl-amber">67 milliseconds ago</span>.`,
-    `Your position fix is computed from at least <span class="hl">4 satellites</span>: three for X/Y/Z, and one extra to solve for the receiver's clock offset.`,
-    `Russia's GLONASS, China's BeiDou, and Europe's Galileo each operate <span class="hl">independent satellite constellations</span> for global positioning. Many modern receivers combine all four.`,
-    `A GPS satellite weighs about <span class="hl">2,000 kg</span> and is powered by solar panels generating roughly <span class="hl-amber">1.5 kW</span>.`,
-    `The signal you receive from each GPS satellite is below the noise floor, weaker than <span class="hl">-130 dBm</span>. Your receiver de-spreads it using known pseudo-random codes.`,
-    `If GPS satellites didn't correct for relativity, position fixes would drift by <span class="hl-amber">~11 km per day</span>.`,
-    `GPS satellites broadcast on <span class="hl">L1 (1575.42 MHz)</span> and <span class="hl">L2 (1227.60 MHz)</span>. Civilian receivers primarily use L1 C/A code.`,
-    `A single GPS L1 carrier wave cycle takes <span class="hl">0.65 nanoseconds</span>. Your timing precision is in that same neighborhood.`,
-    `Sky-view satellites visible to your antenna right now: <span class="hl">${visible}</span>. The maximum theoretically observable from any point on Earth is around <span class="hl-amber">12</span> at once.`,
-
-    // Human comparisons
-    `A human eye blinks in about <span class="hl">100 milliseconds</span>. Your last offset is <span class="hl-amber">${(1e8 / Math.max(ns, 1)).toFixed(0)}x</span> faster than a blink.`,
-    `A neuron in your brain fires in about <span class="hl">1 millisecond</span>. Your last offset is <span class="hl-amber">${(1e6 / Math.max(ns, 1)).toFixed(0)}x</span> shorter than one neural firing.`,
-    `The fastest human reaction time on record is about <span class="hl">100 ms</span>. Your offset is <span class="hl-amber">${(1e8 / Math.max(ns, 1)).toFixed(0)}x</span> tighter than human reflexes.`,
-    `Audio engineers can perceive timing differences down to about <span class="hl">10 microseconds</span> between ears. Your offset is <span class="hl-amber">${(10000 / Math.max(ns / 1000, 1)).toFixed(0)}x</span> smaller.`,
-    `A high-speed camera shooting at <span class="hl">10,000 frames per second</span> captures one frame every 100 microseconds. Your offset is far below that.`,
-    `Movies project at <span class="hl">24 frames per second</span>, so one frame is 41.7 ms. Your offset is <span class="hl-amber">${(41.7e6 / Math.max(ns, 1)).toFixed(0)}x</span> shorter than a single film frame.`,
-
-    // Frequency, drift, skew
-    `Your clock's frequency error is <span class="hl">${freq.toFixed(2)} ppm</span>. A typical wristwatch drifts at around <span class="hl-amber">10-50 ppm</span>.`,
-    `Your skew of <span class="hl">${skew.toFixed(3)} ppm</span> means your local oscillator can drift by less than <span class="hl-amber">${(skew * 86.4).toFixed(0)} microseconds per day</span> if left undisciplined.`,
-    `The Pi 4's crystal oscillator runs at <span class="hl">19.2 MHz</span>. Without GPS discipline, it would drift by roughly <span class="hl-amber">${Math.abs(freq * 86.4).toFixed(0)} ms per day</span>.`,
-    `A quartz crystal in a typical computer drifts by <span class="hl">several seconds per day</span>. Yours is corrected continuously, kept to nanoseconds.`,
-    `Temperature changes of <span class="hl">1°C</span> shift a typical quartz oscillator's frequency by about <span class="hl-amber">0.04 ppm</span>. Your CPU at ${temp || '37°C'} is being compensated in real time.`,
-    `Your residual frequency tells chrony how much its current correction is missing the mark. Values near zero mean the loop has fully converged.`,
-    `Allan deviation measures how a clock's frequency varies over different averaging intervals. A typical TCXO sits around <span class="hl">10^-7</span>; your GPS-disciplined clock reaches <span class="hl-amber">10^-9</span> or better.`,
-
-    // Stratum and NTP fundamentals
-    `Stratum <span class="hl">${stratum}</span> means you're directly disciplined by GPS. Most internet NTP clients you'll meet are stratum 3 or worse.`,
-    `NTP stratum increases by one for each layer down the hierarchy. Reference clocks (atomic, GPS) are stratum 0. You read from one directly, making you stratum 1.`,
-    `The first NTP RFC was published in <span class="hl">1985</span>. The protocol you're running has been refined for over <span class="hl-amber">40 years</span>.`,
-    `NTP version 4, the current spec, was standardized in <span class="hl">RFC 5905 (2010)</span>. Chrony implements it with optional NTS extensions for authentication.`,
-    `The NTP packet you send is exactly <span class="hl">48 bytes</span> on the wire. The protocol has changed very little since the 1980s.`,
-    `Chrony was created by <span class="hl">Richard Curnow</span> in 1997, designed for systems with intermittent network connections, like dial-up. It now powers Stratum 1 servers worldwide.`,
-    `Many Linux distributions replaced ntpd with chrony as the default time daemon between <span class="hl">2014 and 2020</span>, citing faster convergence and lower resource use.`,
-
-    // Server activity
-    `Since boot, this server has answered <span class="hl">${ntpRx.toLocaleString()}</span> NTP packets. ${uptime}.`,
-    `An NTP exchange uses <span class="hl">UDP port 123</span>. The 48-byte packet has been the same shape since 1985.`,
-    `Your server is operating <span class="hl">stateless</span>. It doesn't track clients; each query is independent. Yet you still see <span class="hl-amber">${ntpRx.toLocaleString()}</span> requests served.`,
-
-    // PPS and discipline
-    `Your PPS pulse has fired <span class="hl">${ppsTotal.toLocaleString()}</span> times since boot. That's one per second from a satellite signal originating in space.`,
-    `PPS stands for <span class="hl">Pulse Per Second</span>. A precise voltage rising edge from your GPS module marks the start of each second to within nanoseconds.`,
-    `Your PPS signal arrives as a hardware interrupt, bypassing the OS scheduler entirely. That's why GPS-disciplined Linux can hit nanosecond precision.`,
-    `Without PPS, GPS time discipline is limited to about <span class="hl">100 ms</span> due to serial data jitter. With PPS, you can reach <span class="hl-amber">tens of nanoseconds</span>.`,
-
-    // Physics / relativity / metrology
-    `Cesium-133 atoms vibrate <span class="hl">9,192,631,770 times per second</span>. That's the official definition of one second since 1967.`,
-    `The kilogram was redefined in 2019 using Planck's constant. The second, however, has been atomically defined since <span class="hl">1967</span>. Time is the most precisely measured quantity in physics.`,
-    `One nanosecond per year is the accuracy of the best lab atomic clocks. Your server is about <span class="hl">${(ns / 1).toFixed(0)}x</span> less accurate, but still excellent for civilian use.`,
-    `NIST's <span class="hl">NIST-F2 fountain clock</span> would neither gain nor lose a second in 300 million years. Your clock is about a million times less precise, but a billion times cheaper.`,
-    `The Earth's rotation slows by about <span class="hl">1.7 ms per century</span>. Your clock is more stable than the planet itself.`,
-    `A second on a GPS satellite is measurably <span class="hl">~38 microseconds longer per day</span> than one on Earth, due to weaker gravity (general relativity).`,
-    `Time runs slower in stronger gravity. The clock at your feet ticks <span class="hl">10^-16</span> slower than one near your head, a difference measurable with optical lattice clocks.`,
-    `The world's most precise clock, an optical lattice strontium clock at JILA, has uncertainty around <span class="hl">10^-18</span>, equivalent to losing one second in the age of the universe.`,
-    `Coordinated Universal Time (UTC) is maintained by averaging <span class="hl">~400 atomic clocks</span> at <span class="hl-amber">~80 labs</span> worldwide. The result is published monthly by the BIPM in Paris.`,
-    `International Atomic Time (TAI) doesn't include leap seconds. UTC stays close to solar time by inserting them periodically. <span class="hl">UTC = TAI - 37 seconds</span> right now.`,
-    `Stock exchanges require time accuracy of <span class="hl">100 microseconds</span> for trade timestamps. You're <span class="hl-amber">${(100000 / Math.max(ns / 1000, 1)).toFixed(0)}x</span> better than that requirement.`,
-    `MiFID II regulations require financial firms to timestamp orders to <span class="hl">100 microseconds</span> traceable to UTC. Your stratum 1 box would satisfy that requirement out of the box.`,
-    `Power grids synchronize their AC waveforms to <span class="hl">±10 microseconds</span> across continents. Time disciplines power as much as it disciplines computers.`,
-    `Cellular base stations require time sync to <span class="hl">a few microseconds</span> for handoffs to work. Your server is precise enough to run a small cell network.`,
-
-    // Leap seconds and edge cases
-    `GPS time is currently <span class="hl">18 seconds ahead of UTC</span> due to leap seconds. Your chrony daemon handles that conversion automatically.`,
-    `A leap second has not been added since <span class="hl">December 31, 2016</span>. In 2022, the world's metrologists voted to abolish leap seconds by 2035.`,
-    `The clock has experienced <span class="hl">27 leap seconds</span> since UTC was synchronized to atomic time in 1972. All but one were positive (extra seconds added).`,
-    `Negative leap seconds, where the clock skips a second, have never been needed but remain part of the spec. Earth's rotation has slightly sped up in recent years.`,
-
-    // Performance / math
-    `A modern CPU executes about <span class="hl">3 billion instructions per second</span>. In your current offset of <span class="hl-amber">${offsetStr}</span>, it could run roughly <span class="hl">${Math.max(1, Math.floor(3 * ns)).toLocaleString()}</span> instructions.`,
-    `If your offset stays at <span class="hl">${offsetStr}</span>, your clock would gain or lose only <span class="hl-amber">${(ns * 86400 / 1e9).toFixed(6)} seconds per day</span>.`,
-    `Root delay of <span class="hl">${rootDelay}</span> is the round-trip latency to your time reference. For GPS-disciplined clocks this should be near zero.`,
-    `Your CPU is running at <span class="hl">${temp}</span>. Atomic clocks in GPS satellites are kept at constant temperature in deep space, varying by less than <span class="hl-amber">1°C</span>.`,
-    `The Allan deviation of a typical TCXO is <span class="hl">10^-7</span>. Your GPS-disciplined clock achieves better than <span class="hl-amber">10^-9</span> after stabilization.`,
-
-    // Hardware tidbits
-    `The Raspberry Pi's broadcom SoC has a hardware <span class="hl">system timer</span> running at 1 MHz, accessible via memory-mapped registers, giving microsecond precision before any GPS help.`,
-    `Your GPS module's antenna is sensitive to signals weaker than a millionth of a billionth of a watt. Yet from <span class="hl">20,200 km away</span>, it pulls out timing to nanoseconds.`,
-    `A typical GPS receiver chipset draws under <span class="hl">100 mW</span>. The satellites broadcasting to it draw <span class="hl-amber">15,000x</span> more power.`,
-    `The PPS signal often arrives via a single GPIO pin. From a hardware perspective, a Stratum 1 time server can be built around <span class="hl">three wires and a $30 module</span>.`,
-
-    // History
-    `Before atomic clocks, the second was defined as <span class="hl">1/86,400 of a mean solar day</span>. We discovered Earth's rotation was too erratic for precision science.`,
-    `John Harrison built the first marine chronometer in 1761 to solve the longitude problem. His H4 lost only <span class="hl">5 seconds in 81 days</span> at sea, a feat unrivaled for a century.`,
-    `The transatlantic telegraph cable of 1858 was the first time signal sent globally. It marked the beginning of synchronized world time.`,
-    `Railway time forced the first time zones in the 1840s. Before that, every town kept its own local solar time. Your clock now synchronizes with all of them via a single second standard.`,
-    `Greenwich Mean Time (GMT) was adopted as the world reference in <span class="hl">1884</span> at the International Meridian Conference. UTC replaced it in 1972 as the atomic-based successor.`,
-
-    // Bandwidth and packet trivia
-    `NTP traffic is among the lightest on the internet, around <span class="hl">90 bytes per packet</span> including UDP/IP headers. Your server handles thousands of these for negligible bandwidth.`,
-    `An NTP packet's timestamp field uses <span class="hl">64 bits</span>: 32 for seconds since 1900, 32 for fractional seconds (~233 picosecond resolution).`,
-    `NTP's timestamp will roll over in <span class="hl">2036</span>. NTPv4's 128-bit Era field already solves this, but most implementations still rely on the 32-bit format.`,
-    `Public NTP server "ntp.org" handles <span class="hl">over a billion packets per day</span> globally. Your private server avoids that load entirely.`,
-  ];
-
-  return facts[Math.floor(Math.random() * facts.length)];
-}
-
-let prog = document.getElementById('refresh-progress');
-function startProgress() {
-  prog.style.transition = 'none';
-  prog.style.width = '0%';
-  requestAnimationFrame(() => {
-    prog.style.transition = `width ${REFRESH_S}s linear`;
-    prog.style.width = '100%';
-  });
-}
-
-// ============================================================================
-// Tooltip system: definitions for every labeled metric on the dashboard.
-// Add or edit entries here, then attachTooltips() picks them up automatically.
-// ============================================================================
-const GLOSSARY = {
-  // Header meta
-  'Node': 'The IP address this server is reachable at on the local network. Clients use this address to query for time.',
-  'Uptime': 'How long the chrony daemon has been continuously running since the last boot or restart.',
-  'Core Temp': 'Temperature of the CPU. Affects the local oscillator frequency. Stable temperatures yield more stable clocks.',
-  'Mission Time': 'The current system time as reported by the server, in UTC. Refreshed each time telemetry is fetched.',
-  'Status': 'TRANSMITTING means chrony has a synchronised source and is serving time. NOT SYNCED means it has none. NO LINK means this page cannot reach the dashboard server, so everything shown is old.',
-
-  // GPS Subsystem
-  'Fix Mode': '3D means latitude, longitude, and altitude are all being computed. 2D means altitude is unavailable. No Fix means the receiver cannot solve a position.',
-  'Satellites Locked / Visible': 'Locked: satellites actively being used in the time/position solution. Visible: total satellites the receiver can see in the sky.',
-  'Best SNR (dB-Hz)': 'Signal-to-noise ratio of the strongest satellite signal. Higher is better. Values above 40 dB-Hz indicate excellent reception.',
-  'HDOP': 'Horizontal Dilution of Precision. A geometric quality factor for the horizontal position fix. Lower is better: <1 is ideal, 1-2 is excellent, 2-5 is good, >5 is poor.',
-  'PDOP': 'Position Dilution of Precision. Combines horizontal and vertical geometry. Lower means the satellites are well-distributed for an accurate 3D fix.',
-  'Position': 'Latitude and longitude of the antenna, computed from satellite signals. Accuracy is typically a few meters with a good fix.',
-  'Altitude': 'Height above the WGS84 ellipsoid (approximately mean sea level). Typically less accurate than horizontal position due to satellite geometry.',
-  'Time Since Lock': 'How long the receiver has held a fix without a break, as tracked by this dashboard (checked every 10 seconds). A leading ">" means the fix was already there when the dashboard started, so the true figure is longer.',
-
-  // Offset / Stratum / Frequency
-  'System Offset': 'The estimated difference between your system clock and the true reference time. Smaller is better; near-zero values indicate excellent discipline.',
-  'Last Offset': 'The most recent measured offset between your clock and the GPS reference at the last update.',
-  'Stratum Level': 'Your position in the NTP hierarchy. Stratum 0 is the reference clock itself (GPS, atomic). Stratum 1 reads directly from it. Each downstream layer adds 1.',
-  'NTP Stratum': 'Stratum number assigned to packets your server sends out. Lower means closer to the time source. 1 is the lowest a server can advertise.',
-  'Frequency Drift': 'How much the local oscillator drifts per second relative to true time, expressed in parts per million (ppm). Chrony compensates for this in real time.',
-  'Clock Offset': 'The current frequency correction chrony is applying to keep your clock locked. Reflects how far off the raw oscillator runs.',
-
-  // PPS card
-  'PPS Discipline (recent samples)': 'A sparkline of recent Pulse-Per-Second samples from the GPS receiver. Tighter clustering means more stable hardware timing.',
-  'Min': 'Smallest (most negative or zero) sample value in the recent PPS history.',
-  'Max': 'Largest sample value in the recent PPS history.',
-  'Range': 'Difference between Min and Max. A small range indicates a stable PPS source.',
-  'Sample count': 'Number of recent PPS samples included in this view.',
-  'PPS IRQ Total': 'Total count of PPS hardware interrupts received since boot. One pulse per second when GPS is locked.',
-
-  // Tracking detail
-  'Tracking Detail': 'Detailed metrics from "chronyc tracking" describing your synchronization state.',
-  'Reference ID': 'Identifier of the time source chrony is currently using. For GPS this is typically a refclock name like "GPS" or "PPS".',
-  'Ref Time (UTC)': 'The UTC timestamp of the most recent measurement from the reference clock.',
-  'Update Interval': 'How often chrony updates its estimate of the system clock, in seconds.',
-  'Root Delay': 'Total round-trip network delay to the stratum 0 reference. For GPS-disciplined clocks this is effectively zero.',
-  'Root Dispersion': 'Accumulated maximum error estimate up the stratum chain. Bounds how wrong your time could plausibly be.',
-  'Residual Freq': 'The portion of frequency error chrony has not yet corrected. Approaches zero as the loop converges.',
-  'Activity': 'Counts of NTP sources by state: online, offline, burst-in-progress, etc.',
-
-  // Hardware vitals
-  'Hardware Vitals': 'System-level metrics about the machine running chrony.',
-  'Hostname': 'The machine name as reported by the kernel.',
-  'IP Address': 'Primary network interface IP address.',
-  'Core Temperature': 'Current CPU package temperature. Higher temperatures can affect oscillator stability.',
-  'Memory': 'RAM usage on the server.',
-  'Load Average': 'System load over 1, 5, and 15 minute windows. Values below your core count are healthy.',
-  'System Uptime': 'How long the OS has been running since the last boot.',
-  'Isolated Cores': 'CPU cores reserved via isolcpus for time-critical tasks, kept off the general scheduler.',
-  'Leap Data Expiry': 'Date by which the current leap-second table will need updating. Stale leap data can introduce errors.',
-
-  // CPU
-  'CPU Core Utilization': 'Per-core CPU usage. Spikes on isolated cores can affect timestamping precision.',
-
-  // NTP service
-  'NTP Service Statistics': 'Aggregate counts of NTP and command packets handled by chrony since startup.',
-  'NTP Packets Received': 'Total NTP queries answered since chrony started.',
-  'NTP Packets Dropped': 'NTP queries refused due to rate limiting, access control, or malformed packets.',
-  'Command Packets Received': 'chronyc administrative commands received over the local socket.',
-  'Command Packets Dropped': 'Administrative commands rejected, usually due to permission rules.',
-  'Client Log Records Dropped': 'Per-client tracking entries that overflowed the log buffer. High values may indicate many distinct clients.',
-
-  // Cards / section titles
-  'GPS Subsystem': 'Live status of the GPS receiver and the satellites it can see.',
-  'Authoritative Time (Disseminated From This Node)': 'The current time this server is broadcasting to NTP clients. This is what your network sees as "the truth".',
-  'Time Sources': 'List of upstream time references chrony is comparing against. For a stratum 1 server, refclocks (GPS, PPS) appear here.',
-  'Source Statistics': 'Long-term statistics for each source: sample counts, frequency, offset, and standard deviation.',
-  'Connected Clients': 'Devices currently being served NTP time by this node.',
-
-  // Time Sources table headers
-  'State': 'Source state symbol: * (synced), + (combined), - (not combined), ? (unreachable, or unusable if it still answers), x (false ticker), ~ (too variable). Sources configured with noselect show as noselect.',
-  'Source': 'Hostname, IP, or refclock identifier of the time source.',
-  'Stratum': 'Stratum level reported by this source.',
-  'Poll': 'log2 of the polling interval in seconds. A poll of 6 means querying every 64 seconds.',
-  'Reach': 'Octal value tracking the last 8 polls. 377 (octal) means all 8 recent polls succeeded.',
-  'Last Rx': 'Time since the last packet was received from this source, in seconds.',
-  'Offset': 'Measured time difference between your clock and this source.',
-  'Margin': 'Estimated error margin on the last measurement.',
-
-  // Source stats table headers
-  'Samples (NP/NR)': 'Number of points used (NP) and runs (NR) in the regression analysis for this source.',
-  'Span': 'Time span covered by the samples used in the regression, in seconds.',
-  'Freq Skew': 'Estimated uncertainty in the frequency estimate, in ppm.',
-  'Std Dev': 'Standard deviation of the measurements, indicating consistency.',
-
-  // Clients table headers
-  'Client': 'Hostname or IP of the connecting NTP client.',
-  'NTP Requests': 'Total queries received from this client.',
-  'Drops': 'Queries from this client that were dropped (e.g., rate-limited).',
-  'Last Query': 'Time since the last query from this client.',
-};
-
-let _tipPop = null;
-function _ensureTipPop() {
-  if (!_tipPop) {
-    _tipPop = document.createElement('div');
-    _tipPop.className = 'tip-pop';
-    document.body.appendChild(_tipPop);
-  }
-  return _tipPop;
-}
-
-function _showTip(target, label, text) {
-  const pop = _ensureTipPop();
-  pop.innerHTML = `<span class="tip-title">${label}</span>${text}`;
-  pop.classList.add('visible');
-  // Position after render so we know its size
-  requestAnimationFrame(() => {
-    const r = target.getBoundingClientRect();
-    const popR = pop.getBoundingClientRect();
-    const margin = 8;
-    let left = r.left;
-    let top = r.bottom + margin;
-    // Flip below->above if it would overflow the viewport bottom
-    if (top + popR.height > window.innerHeight - 8) {
-      top = r.top - popR.height - margin;
-    }
-    // Clamp horizontally
-    if (left + popR.width > window.innerWidth - 8) {
-      left = window.innerWidth - popR.width - 8;
-    }
-    if (left < 8) left = 8;
-    pop.style.left = left + 'px';
-    pop.style.top = top + 'px';
-  });
-}
-
-function _hideTip() {
-  if (_tipPop) _tipPop.classList.remove('visible');
-}
-
-function attachTooltips(root) {
-  root = root || document;
-  // Selectors covering every kind of label that should be hoverable
-  const selectors = ['.stat-key', '.card-title', '.header-meta dt', 'th', '.hero-stat .lbl'];
-  const nodes = root.querySelectorAll(selectors.join(','));
-  nodes.forEach(el => {
-    if (el.dataset.tipBound) return;
-    const text = (el.textContent || '').trim();
-    if (!text) return;
-    const def = GLOSSARY[text];
-    if (!def) return;
-    el.setAttribute('data-tip', '1');
-    el.dataset.tipBound = '1';
-    el.addEventListener('mouseenter', () => _showTip(el, text, def));
-    el.addEventListener('mouseleave', _hideTip);
-    el.addEventListener('focus', () => _showTip(el, text, def));
-    el.addEventListener('blur', _hideTip);
-    // Tap support for touch devices: tap the label to toggle the tooltip
-    el.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      const pop = _ensureTipPop();
-      const isVisibleForThis = pop.classList.contains('visible') && pop.dataset.owner === el.dataset.tipBound + el.textContent;
-      if (isVisibleForThis) {
-        _hideTip();
-      } else {
-        pop.dataset.owner = el.dataset.tipBound + el.textContent;
-        _showTip(el, text, def);
-      }
-    });
-    el.tabIndex = 0;
-  });
-}
-
-// Dismiss any visible tooltip when tapping/clicking elsewhere
-document.addEventListener('click', _hideTip);
-
-async function fetchData() {
-  if (fetching) return;  // the previous poll has not finished; do not pile up
-  fetching = true;
-  const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), 10000);
-  try {
-    const res = await fetch('/api/status', { signal: abort.signal, cache: 'no-store' });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    const wasHidden = document.getElementById('dashboard').style.display !== 'block';
-    document.getElementById('loading').style.display = 'none';
-    document.getElementById('dashboard').style.display = 'block';
-    if (wasHidden) { requestAnimationFrame(resizeCanvas); }
-    linkLost = false;
-    render(data);
-    lastGoodAt = performance.now();
-    attachTooltips();
-  } catch (e) {
-    document.getElementById('loading').textContent = '\u2715 TELEMETRY LINK FAILED';
-    showLinkLost();
-    console.error(e);
-  } finally {
-    clearTimeout(timer);
-    fetching = false;
-  }
-  startProgress();
-}
-
-updateWorldClock();
-attachTooltips();
-fetchData();
-setInterval(fetchData, REFRESH_S * 1000);
-</script>
-</body>
-</html>
-"""
 
 
 class StatusCache:
@@ -2914,7 +958,9 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
+        # Scripts only from this server: the page has no inline script.
+        "script-src 'self'; "
+        # 'unsafe-inline' is for style="" attributes (bar widths and the like).
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src https://fonts.gstatic.com; "
         "img-src 'self' data:; "
@@ -2922,6 +968,60 @@ SECURITY_HEADERS = {
         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     ),
 }
+
+
+# ============================================================================
+# The page: static/index.html plus the stylesheet and script it links to.
+# All three are read once at startup and kept in memory, plain and gzipped.
+# ============================================================================
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+STATIC_FILES = {
+    "/static/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
+    "/static/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
+}
+ASSETS = {}   # URL path -> {"body", "gzip", "type", "version"}
+PAGE = {}     # {"body", "gzip"} for index.html
+
+
+def detect_timezone():
+    """The server's IANA time zone name (e.g. America/Los_Angeles), or UTC."""
+    try:
+        with open("/etc/timezone") as f:
+            name = f.read().strip()
+        if name:
+            return name
+    except OSError:
+        pass
+    try:
+        target = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in target:
+            return target.split("/zoneinfo/", 1)[1]
+    except OSError:
+        pass
+    return "UTC"
+
+
+def load_page(hostname=None, tz=None, static_dir=STATIC_DIR):
+    """Read the page and its assets from disk into ASSETS and PAGE."""
+    versions = {}
+    for url, (filename, content_type) in STATIC_FILES.items():
+        with open(os.path.join(static_dir, filename), "rb") as f:
+            body = f.read()
+        # The version goes in the page's links, so a changed file gets a new
+        # URL and browsers can cache each version indefinitely.
+        version = hashlib.sha256(body).hexdigest()[:12]
+        ASSETS[url] = {"body": body, "gzip": gzip.compress(body, 9),
+                       "type": content_type, "version": version}
+        versions[filename] = version
+    with open(os.path.join(static_dir, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    html = (html
+            .replace("{hostname}", html_escape(hostname or socket.gethostname()))
+            .replace("{timezone}", html_escape(tz or detect_timezone(), quote=True))
+            .replace("{css_version}", versions["dashboard.css"])
+            .replace("{js_version}", versions["dashboard.js"]))
+    body = html.encode()
+    PAGE.update(body=body, gzip=gzip.compress(body, 9))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2950,45 +1050,62 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(data, default=str).encode()
         self._send(status, body, "application/json")
 
-    def send_page(self):
-        # The page is fixed after startup, so it is encoded and gzipped once.
+    def _send_compressible(self, item, content_type, cache):
         extra = {"Vary": "Accept-Encoding"}
-        body = PAGE_BYTES
+        body = item["body"]
         if "gzip" in self.headers.get("Accept-Encoding", ""):
-            body = PAGE_GZIP
+            body = item["gzip"]
             extra["Content-Encoding"] = "gzip"
-        self._send(200, body, "text/html; charset=utf-8", extra=extra)
+        self._send(200, body, content_type, cache=cache, extra=extra)
 
     def _record_visitor(self):
         try:
             record_visitor(client_ip(self.client_address[0], self.headers),
                            self.headers.get("User-Agent", "unknown"))
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 - counting visitors must never fail a request
+            log.exception("could not record visitor")
 
     def do_GET(self):
-        path = urlsplit(self.path).path
+        url = urlsplit(self.path)
+        path = url.path
 
         if path == "/api/status":
             # Record viewer activity on API polls (the page polls while open).
             self._record_visitor()
             try:
-                self.send_json(STATUS_CACHE.get())
-            except Exception as e:
-                print(f"[chrony-dashboard] status error: {e!r}", flush=True)
+                data = STATUS_CACHE.get()
+                if not viewer_is_local(self.client_address[0], self.headers):
+                    data = redact(data)
+                self.send_json(data)
+            except Exception:  # noqa: BLE001 - answer 500 rather than drop the connection
+                log.exception("could not build the status snapshot")
                 self.send_json({"error": "internal error"}, status=500)
         elif path == "/api/health":
-            # Small endpoint for monitoring and deploy checks.
+            # Small endpoint for monitoring and deploy checks. Always 200 with
+            # the status in the body; with ?strict=1 the HTTP status itself
+            # says it (503 unless OK), for monitors that only look at that.
             try:
                 d = STATUS_CACHE.get()
+                healthy = d["health"]["status"] == "OK"
+                strict = parse_qs(url.query).get("strict", ["0"])[0] not in ("", "0")
                 self.send_json({"status": d["health"]["status"],
                                 "issues": d["health"]["issues"],
-                                "reference_id": d["tracking"]["reference_id"]})
-            except Exception:
+                                "reference_id": d["tracking"]["reference_id"]},
+                               status=503 if strict and not healthy else 200)
+            except Exception:  # noqa: BLE001 - see above
+                log.exception("could not build the health report")
                 self.send_json({"status": "ERROR"}, status=500)
         elif path in ("/", "/index.html"):
             self._record_visitor()
-            self.send_page()
+            self._send_compressible(PAGE, "text/html; charset=utf-8", "no-store")
+        elif path in ASSETS:
+            asset = ASSETS[path]
+            # Only the URL the page links to (with its version) is cacheable
+            # for good; anything else must be revalidated.
+            current = parse_qs(url.query).get("v", [""])[0] == asset["version"]
+            self._send_compressible(
+                asset, asset["type"],
+                "public, max-age=31536000, immutable" if current else "no-cache")
         else:
             self._send(404, b"not found\n", "text/plain; charset=utf-8")
 
@@ -2999,13 +1116,6 @@ class Handler(BaseHTTPRequestHandler):
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
-
-
-def set_page(html):
-    global PAGE_HTML, PAGE_BYTES, PAGE_GZIP
-    PAGE_HTML = html
-    PAGE_BYTES = html.encode()
-    PAGE_GZIP = gzip.compress(PAGE_BYTES, 9)
 
 
 def main():
@@ -3019,22 +1129,23 @@ def main():
     parser.add_argument("--trusted-proxy", action="append", default=[], metavar="IP",
                         help="reverse proxy whose X-Real-IP header gives the real "
                              "visitor address (repeatable)")
+    parser.add_argument("--timezone", metavar="NAME",
+                        help="IANA time zone for the header clock "
+                             "(default: this server's, e.g. America/Los_Angeles)")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     CONFIG["pps_refid"] = args.pps_refid
     STATUS_CACHE.ttl = args.cache_ttl
     TRUSTED_PROXIES.update(args.trusted_proxy)
-    set_page(HTML.replace("{hostname}", html_escape(socket.gethostname())))
+    load_page(tz=args.timezone)
     threading.Thread(target=_gps_monitor, name="gps-monitor", daemon=True).start()
 
     server = DashboardServer((args.bind, args.port), Handler)
-    print(f"[chrony-dashboard] Listening on http://{args.bind}:{args.port}", flush=True)
+    log.info("listening on http://%s:%s", args.bind, args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[chrony-dashboard] Stopped.")
-
-
-set_page(HTML)
+        log.info("stopped")
 
 
 if __name__ == "__main__":

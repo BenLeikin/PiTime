@@ -1,5 +1,6 @@
 """Tests for the dashboard's parsers, using recorded chronyc/gpsd output."""
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -19,7 +20,7 @@ _spec.loader.exec_module(cd)
 
 # Recorded from chrony 4.9 (`chronyc -n -c ...`).
 SOURCES_CSV = """\
-^,?,10.0.0.16,0,6,0,4294967295,0.000000000,0.000000000,0.000000000
+^,?,192.0.2.16,0,6,0,4294967295,0.000000000,0.000000000,0.000000000
 ^,+,162.159.200.1,3,9,377,352,-0.010559363,-0.010559363,0.023447527
 ^,*,162.159.200.123,3,10,377,940,-0.009622829,-0.010018874,0.026427295
 #,*,PPS,0,4,377,15,0.000000012,0.000000020,0.000000101
@@ -27,7 +28,7 @@ SOURCES_CSV = """\
 """
 
 SOURCESTATS_CSV = """\
-10.0.0.16,0,0,0,0.000,2000.000,0.000000000,4.000000000
+192.0.2.16,0,0,0,0.000,2000.000,0.000000000,4.000000000
 162.159.200.1,6,3,7222,-1.387,3.784,-0.007031661,0.002260464
 162.159.200.123,32,13,28964,0.163,0.181,0.001009292,0.002714957
 """
@@ -121,7 +122,7 @@ class ChronycParserTests(unittest.TestCase):
             states = {s["name"]: s["state"] for s in cd.parse_sources()}
         self.assertEqual(states["NMEA"], "noselect")
         self.assertEqual(states["PPS"], "synced")
-        self.assertEqual(states["10.0.0.16"], "unreachable")
+        self.assertEqual(states["192.0.2.16"], "unreachable")
 
     def test_selectdata_not_authorised(self):
         with mock.patch.object(cd, "run", fake_run({"sources": SOURCES_CSV,
@@ -209,10 +210,8 @@ class FakeGpsd:
             conn.recv(4096)
             for m in self.messages:
                 conn.sendall((json.dumps(m) + "\n").encode())
-            try:
+            with contextlib.suppress(OSError):
                 conn.recv(4096)
-            except OSError:
-                pass
 
     def close(self):
         self.sock.close()
@@ -285,6 +284,38 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(a["visitors"]["current"], 1)
         self.assertIsNot(a, b)
+
+
+class HealthTests(unittest.TestCase):
+    TRACKING = {"stratum": "1", "reference_id": "50505300 (PPS)"}
+    GPS = {"available": True, "fix_mode": "3D", "sats_used": 6}
+
+    def test_ok(self):
+        sources = [{"name": "PPS", "state": "synced", "reach": "377"}]
+        self.assertEqual(cd.compute_health(self.TRACKING, sources, self.GPS),
+                         {"status": "OK", "issues": []})
+
+    def test_selected_source_that_went_silent_is_reported(self):
+        # chrony still says "PPS, stratum 1" but no pulse has arrived for 8 polls.
+        sources = [{"name": "PPS", "state": "synced", "reach": "0"}]
+        health = cd.compute_health(self.TRACKING, sources, self.GPS)
+        self.assertEqual(health["status"], "DEGRADED")
+        self.assertEqual(health["issues"], ["PPS is selected but has stopped responding"])
+
+    def test_no_fix_and_internet_time(self):
+        health = cd.compute_health(
+            {"stratum": "4", "reference_id": "A29FC87B (162.159.200.123)"},
+            [{"name": "162.159.200.123", "state": "synced", "reach": "377"}],
+            {"available": True, "fix_mode": "no fix", "sats_used": 0})
+        self.assertEqual(health["status"], "DEGRADED")
+        self.assertEqual(health["issues"],
+                         ["Stratum 4", "GPS fix: no fix", "Not synced to GPS"])
+
+    def test_nothing_synced_is_a_fault(self):
+        health = cd.compute_health({"stratum": "10", "reference_id": "7F7F0101 ()"}, [],
+                                   {"available": False})
+        self.assertEqual(health["status"], "FAULT")
+        self.assertIn("No synced source", health["issues"])
 
 
 class SourceStateTests(unittest.TestCase):
@@ -377,56 +408,221 @@ class GpsdPollTests(unittest.TestCase):
 
 class VisitorTests(unittest.TestCase):
     def setUp(self):
-        self._saved = (cd._visitor_recent.copy(), set(cd._visitor_unique),
-                       cd._visitor_loaded, set(cd.TRUSTED_PROXIES))
-        cd._visitor_recent.clear()
-        cd._visitor_unique.clear()
-        cd._visitor_loaded = True
+        self._proxies = set(cd.TRUSTED_PROXIES)
         cd.TRUSTED_PROXIES.clear()
-        self.saves = []
-        patcher = mock.patch.object(cd, "_save_visitors", lambda: self.saves.append(1))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "visitors.json")
 
     def tearDown(self):
-        recent, unique, loaded, proxies = self._saved
-        cd._visitor_recent.clear()
-        cd._visitor_recent.update(recent)
-        cd._visitor_unique.clear()
-        cd._visitor_unique.update(unique)
-        cd._visitor_loaded = loaded
         cd.TRUSTED_PROXIES.clear()
-        cd.TRUSTED_PROXIES.update(proxies)
+        cd.TRUSTED_PROXIES.update(self._proxies)
+        for name in os.listdir(self.dir):
+            os.unlink(os.path.join(self.dir, name))
+        os.rmdir(self.dir)
 
     def test_real_ip_only_from_trusted_proxy(self):
         headers = {"X-Real-IP": "203.0.113.7"}
-        self.assertEqual(cd.client_ip("10.0.0.69", headers), "10.0.0.69")
-        cd.TRUSTED_PROXIES.add("10.0.0.69")
-        self.assertEqual(cd.client_ip("10.0.0.69", headers), "203.0.113.7")
+        self.assertEqual(cd.client_ip("192.0.2.69", headers), "192.0.2.69")
+        cd.TRUSTED_PROXIES.add("192.0.2.69")
+        self.assertEqual(cd.client_ip("192.0.2.69", headers), "203.0.113.7")
         self.assertEqual(cd.client_ip("198.51.100.1", headers), "198.51.100.1")
-        self.assertEqual(cd.client_ip("10.0.0.69", {}), "10.0.0.69")
+        self.assertEqual(cd.client_ip("192.0.2.69", {}), "192.0.2.69")
+
+    def test_counts_and_persistence(self):
+        log = cd.VisitorLog(path=self.path, save_interval_s=0)
+        log.record("203.0.113.7", "browser-a")
+        log.record("203.0.113.7", "browser-a")     # same visitor again
+        log.record("203.0.113.8", "browser-a")
+        self.assertEqual(log.stats(), {"current": 2, "total_unique": 2})
+        # A new process picks the total up from the file; nobody is viewing yet.
+        self.assertEqual(cd.VisitorLog(path=self.path).stats(),
+                         {"current": 0, "total_unique": 2})
 
     def test_unique_set_is_capped_and_saves_are_throttled(self):
-        with mock.patch.object(cd, "VISITOR_MAX_UNIQUE", 5), \
-             mock.patch.object(cd, "_visitor_last_save", 0.0):
+        log = cd.VisitorLog(path=self.path, max_unique=5, save_interval_s=30)
+        saves = []
+        with mock.patch.object(log, "_save", lambda: saves.append(1)):
             for i in range(50):
-                cd.record_visitor("203.0.113.7", f"agent-{i}")
-        self.assertEqual(len(cd._visitor_unique), 5)
-        self.assertEqual(len(self.saves), 1)   # not one write per new visitor
+                log.record("203.0.113.7", f"agent-{i}")
+        self.assertEqual(len(log.unique), 5)
+        self.assertEqual(len(saves), 1)   # not one write per new visitor
+
+    def test_unreadable_file_is_logged_and_ignored(self):
+        with open(self.path, "w") as f:
+            f.write("{not json")
+        with self.assertLogs("chrony-dashboard", level="WARNING"):
+            self.assertEqual(cd.VisitorLog(path=self.path).stats()["total_unique"], 0)
 
 
 class SystemTests(unittest.TestCase):
     def test_cpu_usage_needs_no_sleep_after_first_call(self):
-        cd.get_cpu_per_core()
+        sampler = cd.CpuSampler()
+        sampler.sample()
         with mock.patch.object(cd.time, "sleep",
                                side_effect=AssertionError("slept")):
-            cores = cd.get_cpu_per_core()
+            cores = sampler.sample()
         self.assertTrue(cores)
         self.assertTrue(all(0.0 <= c["usage"] <= 100.0 for c in cores))
 
     def test_uptime_wording(self):
         with mock.patch("builtins.open", mock.mock_open(read_data="93784.21 1.0\n")):
             self.assertEqual(cd.get_uptime(), "up 1 day, 2 hours, 3 minutes")
+
+
+class PrivacyTests(unittest.TestCase):
+    def setUp(self):
+        self._proxies = set(cd.TRUSTED_PROXIES)
+        cd.TRUSTED_PROXIES.clear()
+
+    def tearDown(self):
+        cd.TRUSTED_PROXIES.clear()
+        cd.TRUSTED_PROXIES.update(self._proxies)
+
+    def test_direct_viewers_are_judged_by_their_own_address(self):
+        self.assertTrue(cd.viewer_is_local("192.168.1.20", {}))
+        self.assertTrue(cd.viewer_is_local("127.0.0.1", {}))
+        self.assertFalse(cd.viewer_is_local("203.0.113.7", {}))
+
+    def test_unknown_proxy_is_treated_as_public(self):
+        # A proxy we were not told about: its own address is private, but the
+        # person behind it could be anyone.
+        self.assertFalse(cd.viewer_is_local("192.168.1.5", {"X-Real-IP": "192.168.1.20"}))
+        self.assertFalse(cd.viewer_is_local("192.168.1.5", {"X-Forwarded-For": "10.0.0.9"}))
+
+    def test_trusted_proxy_passes_on_the_real_address(self):
+        cd.TRUSTED_PROXIES.add("192.168.1.5")
+        self.assertTrue(cd.viewer_is_local("192.168.1.5", {"X-Real-IP": "192.168.1.20"}))
+        self.assertFalse(cd.viewer_is_local("192.168.1.5", {"X-Real-IP": "203.0.113.7"}))
+        self.assertFalse(cd.viewer_is_local("192.168.1.5", {}))            # no header
+        self.assertFalse(cd.viewer_is_local("192.168.1.5", {"X-Real-IP": "junk"}))
+
+    def test_mask_address(self):
+        self.assertEqual(cd.mask_address("203.0.113.57"), "203.0.113.x")
+        self.assertEqual(cd.mask_address("2001:db8:1:2::5"), "2001:db8:1::x")
+        self.assertEqual(cd.mask_address("not-an-address"), "hidden")
+
+    def test_redact_hides_clients_address_and_position(self):
+        data = {"clients": [{"host": "203.0.113.57", "ntp": "9"}],
+                "system": {"ip": "192.168.1.2", "hostname": "time"},
+                "gps": {"lat": 37.1, "lon": -122.2, "alt": 12.5, "fix_mode": "3D"}}
+        out = cd.redact(data)
+        self.assertTrue(out["redacted"])
+        self.assertEqual(out["clients"], [{"host": "203.0.113.x", "ntp": "9"}])
+        self.assertEqual(out["system"], {"ip": "\u2014", "hostname": "time"})
+        self.assertEqual((out["gps"]["lat"], out["gps"]["lon"], out["gps"]["alt"]),
+                         (None, None, 12.5))
+        # The shared snapshot itself is untouched.
+        self.assertEqual(data["clients"][0]["host"], "203.0.113.57")
+        self.assertEqual(data["gps"]["lat"], 37.1)
+
+
+class LoggingTests(unittest.TestCase):
+    def test_recurring_warning_is_logged_once_per_interval(self):
+        cd._warned.pop("test-key", None)
+        with self.assertLogs("chrony-dashboard", level="WARNING") as logs:
+            cd.warn("test-key", "first")
+            cd.warn("test-key", "second")          # suppressed
+            cd.warn("test-key", "third", every=0)  # interval over
+        self.assertEqual([r.getMessage() for r in logs.records], ["first", "third"])
+
+    def test_missing_command_is_logged_not_hidden(self):
+        cd._warned.clear()
+        with self.assertLogs("chrony-dashboard", level="WARNING") as logs:
+            self.assertEqual(cd.run(["/nonexistent/chronyc", "tracking"]), "")
+        self.assertIn("/nonexistent/chronyc tracking failed", logs.output[0])
+
+
+class HttpTests(unittest.TestCase):
+    """The real server on a local port, with a canned snapshot."""
+
+    SNAPSHOT = {
+        "health": {"status": "DEGRADED", "issues": ["GPS fix: no fix"]},
+        "tracking": {"reference_id": "A29FC801 (162.159.200.1)"},
+        "clients": [{"host": "203.0.113.57", "ntp": "9", "drops": "0", "last_query": "5"}],
+        "system": {"ip": "192.168.1.2", "hostname": "time"},
+        "gps": {"lat": 37.1, "lon": -122.2},
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cd.load_page(hostname="test<host>", tz="Europe/Berlin")
+        cls.server = cd.DashboardServer(("127.0.0.1", 0), cd.Handler)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        self.snapshot = json.loads(json.dumps(self.SNAPSHOT))
+        for target, replacement in (
+                ("get", lambda: dict(self.snapshot, visitors={})),):
+            patcher = mock.patch.object(cd.STATUS_CACHE, target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(cd, "record_visitor", lambda ip, ua: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def get(self, path, headers=None):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("GET", path, headers=headers or {})
+            response = conn.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            conn.close()
+
+    def test_page_is_filled_in_and_links_versioned_assets(self):
+        status, headers, body = self.get("/")
+        page = body.decode()
+        self.assertEqual(status, 200)
+        self.assertIn("test&lt;host&gt;", page)            # hostname is escaped
+        self.assertIn('data-timezone="Europe/Berlin"', page)
+        for placeholder in ("{hostname}", "{timezone}", "{css_version}", "{js_version}"):
+            self.assertNotIn(placeholder, page)
+        self.assertNotIn("<script>", page)                  # no inline script
+        csp = headers["Content-Security-Policy"]
+        self.assertIn("script-src 'self';", csp)
+        version = cd.ASSETS["/static/dashboard.js"]["version"]
+        self.assertIn(f"/static/dashboard.js?v={version}", page)
+
+    def test_assets(self):
+        version = cd.ASSETS["/static/dashboard.css"]["version"]
+        status, headers, body = self.get(f"/static/dashboard.css?v={version}")
+        self.assertEqual(status, 200)
+        self.assertIn("immutable", headers["Cache-Control"])
+        self.assertEqual(headers["Content-Type"], "text/css; charset=utf-8")
+        self.assertEqual(body, cd.ASSETS["/static/dashboard.css"]["body"])
+        # An old or missing version must not be cached for good.
+        self.assertEqual(self.get("/static/dashboard.css?v=old")[1]["Cache-Control"], "no-cache")
+        gz = self.get("/static/dashboard.js", {"Accept-Encoding": "gzip"})
+        self.assertEqual(gz[1]["Content-Encoding"], "gzip")
+
+    def test_only_listed_files_are_served(self):
+        for path in ("/static/index.html", "/static/../chrony_dashboard.py",
+                     "/static/", "/chrony_dashboard.py", "/nope"):
+            self.assertEqual(self.get(path)[0], 404, path)
+
+    def test_health_strict_mode_uses_the_http_status(self):
+        status, _, body = self.get("/api/health")
+        self.assertEqual((status, json.loads(body)["status"]), (200, "DEGRADED"))
+        status, _, body = self.get("/api/health?strict=1")
+        self.assertEqual((status, json.loads(body)["status"]), (503, "DEGRADED"))
+        self.snapshot["health"] = {"status": "OK", "issues": []}
+        self.assertEqual(self.get("/api/health?strict=1")[0], 200)
+
+    def test_status_is_full_for_local_viewers_and_redacted_for_others(self):
+        local = json.loads(self.get("/api/status")[2])
+        self.assertNotIn("redacted", local)
+        self.assertEqual(local["clients"][0]["host"], "203.0.113.57")
+        public = json.loads(self.get("/api/status", {"X-Real-IP": "198.51.100.9"})[2])
+        self.assertTrue(public["redacted"])
+        self.assertEqual(public["clients"][0]["host"], "203.0.113.x")
+        self.assertIsNone(public["gps"]["lat"])
 
 
 if __name__ == "__main__":
