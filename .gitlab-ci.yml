@@ -28,7 +28,8 @@ checks:
       if [ ! -x "$LINT_ENV/bin/ruff" ] || [ ! -x "$LINT_ENV/bin/shellcheck" ]; then
         rm -rf "$LINT_ENV"
         python3 -m venv "$LINT_ENV"
-        "$LINT_ENV/bin/pip" install --quiet "ruff==$RUFF_VERSION" "shellcheck-py==$SHELLCHECK_PY_VERSION"
+        # Not --quiet: if a download fails, the job log should say which.
+        "$LINT_ENV/bin/pip" install --progress-bar off --retries 5 --timeout 60 "ruff==$RUFF_VERSION" "shellcheck-py==$SHELLCHECK_PY_VERSION"
       fi
     - export PATH="$LINT_ENV/bin:$PATH"
     # A missing Python or shell tool fails the job...
