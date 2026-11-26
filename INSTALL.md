@@ -19,7 +19,7 @@ Update and install required packages, then get this repository:
 ```bash
 sudo apt update
 sudo apt full-upgrade -y
-sudo apt install -y chrony gpsd gpsd-clients pps-tools python3 git
+sudo apt install -y chrony gpsd gpsd-clients pps-tools python3 git unattended-upgrades
 git clone https://github.com/BenLeikin/PiTime.git
 cd PiTime
 ```
@@ -118,7 +118,7 @@ You should see JSON with TPV (position) and SKY (satellites) data. If no TPV app
 
 ```
 # GPS time of day from gpsd (NMEA sentences), only used to number the pulses
-refclock SHM 0 refid NMEA precision 1e-3 offset 0.121 delay 0.2 noselect
+refclock SHM 0 refid NMEA precision 1e-3 offset 0.070 delay 0.2 noselect
 
 # PPS pulse from GPIO (high precision, used for sync)
 refclock PPS /dev/pps0 refid PPS lock NMEA precision 1e-9 prefer
@@ -142,7 +142,7 @@ ratelimit interval 1 burst 16 leak 2
 sudo ntpshmmon -n 20
 ```
 
-On the `NTP0` lines, the `Clock` column minus the `Real` column is the delay (about 0.12 s for my module at 9600 baud). Put that value in `offset`.
+On the `NTP0` lines, the `Clock` column minus the `Real` column is the delay. Put its average in `offset`. Measure it after the tuning service (section 10) has switched the GPS to 115200 baud, because the delay depends on the speed: for my module it is about 0.070 s at 115200 baud and 0.13 s at the module's default 9600.
 
 Disable chrony's seccomp filter, which silently blocks the PPS device:
 
@@ -184,7 +184,7 @@ Viewers on the Pi's own network see everything. Anyone else sees client addresse
 
 To put it behind a reverse proxy (nginx, Caddy, etc.) for HTTPS, point your proxy at `http://<pi-ip>:8080`, have it send `X-Real-IP`, and give the dashboard the proxy's address with `--trusted-proxy` in `/etc/default/chrony-dashboard`. Without that, everyone coming through the proxy is treated as a public viewer and counted as one visitor. The dashboard sets its own security headers (`Content-Security-Policy`, `X-Frame-Options`, ...); if the proxy adds the same ones, hide the dashboard's copies (`proxy_hide_header` in nginx) so each is sent once.
 
-The PPS jitter chart reads `/var/log/chrony/refclocks.log`, which the repository's `chrony.conf` enables with `log ... refclocks`. Within a few minutes of chrony starting, the chart fills in.
+The PPS chart collects chrony's PPS samples itself, one per poll, and fills in over its first 16 minutes. The History charts below it record one sample a minute and keep 30 days.
 
 If a panel shows a dash where you expect a value, `journalctl -u chrony-webpage` says what the dashboard could not read.
 
@@ -243,11 +243,25 @@ ssh root@host bash /tmp/convert-to-chrony.sh
 
 - sets the CPU governor to `performance`;
 - moves every movable interrupt (network, SD card, Wi-Fi, serial) to CPUs 1-2, leaving CPU 0 to the PPS interrupt, which Linux will not move;
-- sets the u-blox receiver's dynamic model to stationary.
+- sets the u-blox receiver's dynamic model to stationary;
+- sets the receiver's serial port to 115200 baud, so each second's NMEA arrives sooner (gpsd follows the change by itself).
+
+The last two are also saved in the receiver's battery-backed memory (`ubxtool -p SAVE`), but that memory does not survive a long power cut, so the script sends them again at every boot.
 
 Check it with `journalctl -u timeserver-tune`. To undo it, `sudo systemctl disable timeserver-tune` and reboot.
 
 For temperature compensation, the repository's `chrony.conf` logs the CPU temperature (`tempcomp ... 0 0 0 0`, which applies no correction). After a few days of logging, run `tools/fit_tempcomp.py --host <pi>` from a workstation; it prints the `tempcomp` line to put in `chrony.conf`, or says why there is not enough data yet.
+
+### Updates and the watchdog
+
+`install.sh --configs` also sets up automatic security updates (`unattended-upgrades`), which reboot at 03:30 only when an update needs it, and turns on the Pi's hardware watchdog through systemd. If you had a cron job that upgrades and reboots every night, remove it (`sudo crontab -e`); `install.sh` reminds you if it finds one.
+
+Check them with:
+
+```bash
+sudo unattended-upgrade --dry-run --debug 2>&1 | grep -i "allowed origins"
+sudo wdctl
+```
 
 ## 11. Alerts
 

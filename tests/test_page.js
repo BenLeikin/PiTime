@@ -202,3 +202,17 @@ test('time since lock counts from the server record', () => {
   page.render(unknownStart);
   assert.match(elements['g-fix-age'].textContent, /^> 1m 4\ds$/);
 });
+
+test('history charts scale robustly and break lines at gaps', () => {
+  const { page } = loadPage();
+  const spiky = Array.from({ length: 100 }, (_, i) => (i === 50 ? 1000 : i % 2));
+  const plain = page.seriesRange([spiky], false);
+  const robust = page.seriesRange([spiky], true);
+  assert.ok(plain[1] > 1000);            // the spike sets the scale...
+  assert.ok(robust[1] < 2);              // ...unless the axis is robust
+  assert.strictEqual(page.seriesRange([[null, null]], true), null);
+  const d = page.linePath([1, 2, null, 3, 4], 100, 50, 0, 5, 0);
+  assert.strictEqual((d.match(/M/g) || []).length, 2);   // two segments, not one
+  assert.deepStrictEqual([...page.minMax([3, null, -1, 7])], [-1, 7]);
+  assert.strictEqual(page.minMax([null]), null);
+});

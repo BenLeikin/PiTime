@@ -69,13 +69,28 @@ else
   log "moved $moved interrupts to CPUs $OTHER_CPUS (PPS is irq ${pps_irq:-not found}, on CPU 0)"
 fi
 
-# 3. Tell the GPS its antenna does not move (u-blox dynamic model 2,
-#    "stationary"), which steadies its timing. The setting is not stored in the
-#    module, so it is sent on every boot once gpsd is answering.
+# 3. GPS settings. Both are saved in the module's battery-backed memory, but
+#    that is lost if it is without power for long, so they are sent again on
+#    every boot once gpsd is answering:
+#    - 115200 baud. Each second's sentences then arrive in tens of
+#      milliseconds instead of most of a second, so the NMEA time reaches
+#      chrony about 0.07 s after the second instead of 0.13 s (the offset in
+#      chrony.conf is measured for 115200). gpsd follows the change itself.
+#    - Dynamic model 2, "stationary": the antenna does not move, which steadies
+#      the receiver's timing.
+GPS_BAUD="${GPS_BAUD:-115200}"
 if command -v ubxtool >/dev/null; then
   for _ in $(seq 1 30); do
     if timeout 8 ubxtool -p MODEL,2 "$GPSD_DEVICE" 2>/dev/null | grep -q "ACK-ACK"; then
       log "GPS dynamic model: stationary"
+      if timeout 8 ubxtool -p CFG-PRT,1 "$GPSD_DEVICE" 2>/dev/null | grep -q "baudRate $GPS_BAUD\b"; then
+        log "GPS serial speed: $GPS_BAUD (already)"
+      elif gpsctl -s "$GPS_BAUD" "${GPSD_DEVICE##*:}" >/dev/null 2>&1; then
+        log "GPS serial speed: set to $GPS_BAUD"
+      else
+        log "GPS serial speed: could not set $GPS_BAUD"
+        exit 1
+      fi
       exit 0
     fi
     sleep 2

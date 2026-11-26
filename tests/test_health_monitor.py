@@ -2,6 +2,7 @@
 
 import importlib.util
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -58,6 +59,73 @@ class DecideTests(unittest.TestCase):
         messages = self.run_sequence(
             [("DEGRADED", ["a"])] + [("FAULT", ["No synced source"])] * 3)
         self.assertEqual(messages[3], "[ALERT] time server: FAULT (was DEGRADED) - No synced source")
+
+
+def answers(**by_host):
+    """A fake ntp_query: host -> offset in seconds, or an exception to raise."""
+    def query(host):
+        result = by_host[host]
+        if isinstance(result, Exception):
+            raise result
+        if isinstance(result, dict):
+            return result
+        return {"offset": result, "delay": 0.01, "stratum": 2, "leap": 0}
+    return query
+
+
+class NtpCheckTests(unittest.TestCase):
+    REFS = ("ref-a", "ref-b", "ref-c")
+
+    def test_agreeing_server_is_fine(self):
+        query = answers(pi=0.0021, **{"ref-a": 0.0019, "ref-b": 0.0030, "ref-c": 0.0012})
+        self.assertEqual(hm.check_ntp("pi", self.REFS, 0.010, query), [])
+
+    def test_wrong_second_is_caught(self):
+        # Healthy by its own account, but a whole second out.
+        query = answers(pi=1.0003, **{"ref-a": 0.0, "ref-b": 0.001, "ref-c": -0.001})
+        self.assertEqual(hm.check_ntp("pi", self.REFS, 0.010, query),
+                         ["NTP time is +1000.3 ms from 3 outside servers"])
+
+    def test_one_bad_reference_does_not_cause_an_alert(self):
+        query = answers(pi=0.0, **{"ref-a": 0.0, "ref-b": 0.5, "ref-c": 0.001})
+        self.assertEqual(hm.check_ntp("pi", self.REFS, 0.010, query), [])
+
+    def test_unreachable_references_are_skipped(self):
+        query = answers(pi=0.0, **{r: OSError("timed out") for r in self.REFS})
+        self.assertEqual(hm.check_ntp("pi", self.REFS, 0.010, query), [])
+
+    def test_server_problems(self):
+        self.assertEqual(hm.check_ntp("pi", (), 0.01, answers(pi=OSError("timed out"))),
+                         ["NTP did not answer: timed out"])
+        unsynced = {"offset": 0.0, "delay": 0.01, "stratum": 16, "leap": 3}
+        self.assertEqual(hm.check_ntp("pi", self.REFS, 0.01, answers(pi=unsynced)),
+                         ["NTP says it is not synchronised"])
+
+    def test_offset_from_the_four_timestamps(self):
+        # Server 2 s ahead, 100 ms each way: offset 2 s, round trip 200 ms.
+        def ts(t):
+            whole = int(t) + hm.NTP_EPOCH_OFFSET
+            return hm.struct.pack("!II", whole, int((t - int(t)) * 2**32))
+        reply = bytearray(48)
+        reply[0], reply[1] = 0x24, 1
+        reply[32:40] = ts(1002.1)       # server receive
+        reply[40:48] = ts(1002.1)       # server transmit
+        clock = iter([1000.0, 1000.2])  # client send, client receive
+
+        class FakeSocket:
+            def __init__(self, *a): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def settimeout(self, t): pass
+            def sendto(self, data, addr): pass
+            def recvfrom(self, n): return bytes(reply), None
+
+        with mock.patch.object(hm.socket, "socket", FakeSocket), \
+             mock.patch.object(hm.time, "time", lambda: next(clock)):
+            result = hm.ntp_query("pi")
+        self.assertAlmostEqual(result["offset"], 2.0, places=6)
+        self.assertAlmostEqual(result["delay"], 0.2, places=6)
+        self.assertEqual(result["stratum"], 1)
 
 
 class ConfigTests(unittest.TestCase):

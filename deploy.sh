@@ -43,6 +43,9 @@ FILES=(
   etc/sysctl.d/90-timeserver-failover.conf
   usr/local/sbin/timeserver-tune
   systemd/timeserver-tune.service
+  etc/systemd/system.conf.d/90-timeserver-watchdog.conf
+  etc/apt/apt.conf.d/20auto-upgrades
+  etc/apt/apt.conf.d/52timeserver-unattended-upgrades
 )
 
 if command -v git >/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then
@@ -84,7 +87,10 @@ etc/NetworkManager/dispatcher.d/50-link-failover-garp:/etc/NetworkManager/dispat
 etc/sysctl.d/90-timeserver-failover.conf:/etc/sysctl.d/90-timeserver-failover.conf \
 usr/local/sbin/timeserver-tune:/usr/local/sbin/timeserver-tune \
 systemd/timeserver-tune.service:/etc/systemd/system/timeserver-tune.service \
-site/etc/systemd/system/gitlab-runner.service.d/timeserver.conf:/etc/systemd/system/gitlab-runner.service.d/timeserver.conf"
+site/etc/systemd/system/gitlab-runner.service.d/timeserver.conf:/etc/systemd/system/gitlab-runner.service.d/timeserver.conf \
+etc/systemd/system.conf.d/90-timeserver-watchdog.conf:/etc/systemd/system.conf.d/90-timeserver-watchdog.conf \
+etc/apt/apt.conf.d/20auto-upgrades:/etc/apt/apt.conf.d/20auto-upgrades \
+etc/apt/apt.conf.d/52timeserver-unattended-upgrades:/etc/apt/apt.conf.d/52timeserver-unattended-upgrades"
 
 # Lines install.sh --configs would add to the Pi's boot config.
 boot_diff() {

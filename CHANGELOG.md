@@ -2,6 +2,21 @@
 
 Notable changes to this project. Versions follow [semantic versioning](https://semver.org/): the major number changes when an upgrade needs action on an existing install.
 
+## [2.1.0] - 2026-11-26
+
+### Added
+
+- **History charts**: one sample a minute (offsets, frequency, temperature, satellites, signal, health) kept for 30 days, shown for the last 6 hours to 30 days, and available as `/api/history`.
+- The health monitor compares the time server's time with outside NTP servers, using the four timestamps of each exchange, and alerts if it is further from them than network delay can explain.
+- Automatic security updates with `unattended-upgrades`, rebooting at 03:30 only when an update needs it, in place of a nightly upgrade-and-reboot.
+- The Pi's hardware watchdog, kept fed by systemd.
+- `--state-dir` for where visitor counts and history are kept.
+
+### Changed
+
+- The GPS runs at 115200 baud instead of 9600, and its settings are saved in the receiver. NMEA time now reaches chrony 0.070 s after the second instead of 0.13 s; the NMEA offset in `chrony.conf` changes to match.
+- chrony logs only `tracking` and `tempcomp`. The `measurements`, `statistics` and `refclocks` logs were most of the SD card's writes and nothing read them; the PPS chart now collects its samples from chronyc.
+
 ## [2.0.0] - 2026-11-26
 
 PiTime and the openTimeServer repository are merged into one project.

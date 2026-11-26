@@ -18,8 +18,11 @@ import subprocess
 import json
 import re
 import argparse
+import collections
 import contextlib
+import signal
 import socket
+import sqlite3
 import os
 import time
 import hashlib
@@ -33,7 +36,7 @@ from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, UTC
 
 # Keep in step with the newest entry in CHANGELOG.md (a test checks it).
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 log = logging.getLogger("chrony-dashboard")
 log.addHandler(logging.NullHandler())  # main() sets up real logging
@@ -505,6 +508,56 @@ def parse_activity():
 REFCLOCKS_LOG = "/var/log/chrony/refclocks.log"
 
 
+class PpsSampler:
+    """The PPS refclock's recent filtered samples, collected from chronyc.
+
+    chrony makes one filtered PPS sample per poll (16 s here), and
+    `chronyc sources` reports the latest. Polling that more often than chrony
+    polls catches every sample, so the chart needs no refclocks.log, which is
+    the biggest source of SD card writes. Only if this has nothing yet does the
+    dashboard fall back to reading the log, for setups that keep it.
+    """
+
+    def __init__(self, limit=60):
+        self.samples = collections.deque(maxlen=limit)
+        self._last_time = None
+
+    def poll(self, refid):
+        """Add the latest sample if it is new. Returns True if one was added."""
+        for row in run_csv(["chronyc", "-n", "-c", "sources"]):
+            if len(row) < 10 or row[2] != refid:
+                continue
+            last_rx, offset = safe_int(row[6]), safe_float(row[7])
+            if last_rx is None or last_rx >= CHRONY_NEVER or offset is None:
+                return False
+            # When the sample was taken, to the second; the same sample seen
+            # again on the next poll gives the same time.
+            taken = round(time.time() - last_rx)
+            if self._last_time is not None and abs(taken - self._last_time) <= 1:
+                return False
+            self._last_time = taken
+            self.samples.append(offset)
+            return True
+        return False
+
+    def history(self, refid):
+        """Recent samples, oldest first; from refclocks.log if none collected yet."""
+        return list(self.samples) or parse_pps_history(refid)
+
+
+PPS_SAMPLER = PpsSampler()
+
+
+def _pps_poller(interval=4):
+    """Collect PPS samples as chrony makes them. Runs as a daemon thread."""
+    while True:
+        try:
+            PPS_SAMPLER.poll(CONFIG["pps_refid"])
+        except Exception:  # noqa: BLE001 - the poller must outlive any bug
+            log.exception("pps sampler: unexpected error")
+        time.sleep(interval)
+
+
 def _tail_lines(path, max_bytes=64 * 1024):
     """Return the last lines of a file without reading all of it."""
     with open(path, "rb") as f:
@@ -892,6 +945,7 @@ def get_system_info():
         ip = "—"  # no default route
     uptime_raw = get_uptime()
     temp_str = "—"
+    temp_c = None
     try:
         with open("/sys/class/thermal/thermal_zone0/temp") as f:
             temp_c = round(int(f.read().strip()) / 1000, 1)
@@ -922,6 +976,7 @@ def get_system_info():
         "ip": ip,
         "uptime": uptime_raw,
         "temperature": temp_str,
+        "temperature_c": temp_c,
         "memory": mem_str,
         "loadavg": load_str,
         "timestamp": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -996,7 +1051,7 @@ def get_all_data():
         "cpu_cores":   get_cpu_per_core,
         "pps_irq":     get_pps_irq_count,
         "next_leap":   get_leap_table_expiry,
-        "pps_history": lambda: parse_pps_history(CONFIG["pps_refid"]),
+        "pps_history": lambda: PPS_SAMPLER.history(CONFIG["pps_refid"]),
         "system":      get_system_info,
     }
     futures = {name: _COLLECT_POOL.submit(fn) for name, fn in jobs.items()}
@@ -1033,6 +1088,187 @@ class StatusCache:
 
 CONFIG = {"pps_refid": "PPS"}
 STATUS_CACHE = StatusCache(ttl=2.0)
+
+
+# ============================================================================
+# History: one sample a minute, kept for HISTORY_DAYS, for the charts.
+# ============================================================================
+HISTORY_FILE = os.path.join(VISITOR_DATA_DIR, "history.sqlite3")
+HISTORY_DAYS = 30
+HISTORY_FIELDS = (
+    # name, what it is
+    ("stratum", "chrony's stratum"),
+    ("last_offset_s", "chrony's last clock correction, seconds"),
+    ("rms_offset_s", "chrony's RMS offset, seconds"),
+    ("frequency_ppm", "clock frequency error chrony corrects, ppm (positive = fast)"),
+    ("skew_ppm", "uncertainty of that frequency, ppm"),
+    ("pps_offset_s", "last PPS sample's offset, seconds"),
+    ("pps_reach", "PPS reach register as a number, 0-255"),
+    ("temperature_c", "CPU temperature, degrees C"),
+    ("sats_used", "satellites in the GPS fix"),
+    ("sats_visible", "satellites the GPS lists"),
+    ("best_snr", "strongest signal among satellites in use, dB-Hz"),
+    ("fix", "GPS fix: 0 none, 2 2D, 3 3D"),
+    ("health", "dashboard health: 0 OK, 1 DEGRADED, 2 FAULT"),
+)
+HEALTH_CODES = {"OK": 0, "DEGRADED": 1, "FAULT": 2}
+FIX_CODES = {"2D": 2, "3D": 3}
+HISTORY_RANGES = {"6h": 6 * 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+HISTORY_POINTS = 360   # buckets per chart: enough detail, small responses
+
+
+def history_sample(data):
+    """One history row (a dict of HISTORY_FIELDS) from a status snapshot."""
+    tracking, gps = data.get("tracking", {}), data.get("gps", {})
+    pps = next((src for src in data.get("sources", [])
+                if src.get("name") == CONFIG["pps_refid"]), {})
+    try:
+        reach = int(pps["reach"], 8)  # chronyc prints reach in octal
+    except (KeyError, TypeError, ValueError):
+        reach = None
+    return {
+        "stratum": safe_int(tracking.get("stratum")),
+        "last_offset_s": tracking.get("last_offset_s"),
+        "rms_offset_s": tracking.get("rms_offset_s"),
+        "frequency_ppm": tracking.get("frequency_ppm"),
+        "skew_ppm": tracking.get("skew_ppm"),
+        "pps_offset_s": pps.get("offset_s") if reach else None,
+        "pps_reach": reach,
+        "temperature_c": data.get("system", {}).get("temperature_c"),
+        "sats_used": gps.get("sats_used") if gps.get("available") else None,
+        "sats_visible": gps.get("sats_visible") if gps.get("available") else None,
+        "best_snr": (gps.get("best_snr") or None) if gps.get("available") else None,
+        "fix": FIX_CODES.get(gps.get("fix_mode"), 0) if gps.get("available") else None,
+        "health": HEALTH_CODES.get(data.get("health", {}).get("status")),
+    }
+
+
+class HistoryStore:
+    """A minute-by-minute record of the server's state, for the history charts.
+
+    Samples are kept in memory and written to SQLite every `flush_s` seconds,
+    so the SD card sees one small write every few minutes instead of one a
+    minute. A crash loses at most that much. Rows older than `keep_days` are
+    removed once a day.
+    """
+
+    def __init__(self, path=HISTORY_FILE, keep_days=HISTORY_DAYS, flush_s=600):
+        self.path = path
+        self.keep_s = keep_days * 86400
+        self.flush_s = flush_s
+        self._lock = threading.Lock()
+        self._pending = []           # (ts, row) not yet written
+        self._last_flush = time.monotonic()
+        self._last_prune = 0.0
+        self._ready = False
+
+    def _connect(self):
+        conn = sqlite3.connect(self.path, timeout=10)
+        if not self._ready:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            columns = ", ".join(f"{name} REAL" for name, _ in HISTORY_FIELDS)
+            conn.execute(f"CREATE TABLE IF NOT EXISTS samples (ts INTEGER PRIMARY KEY, {columns})")
+            self._ready = True
+        return conn
+
+    def add(self, row, ts=None):
+        """Queue one sample; writes to disk when the flush interval has passed."""
+        ts = int(ts if ts is not None else time.time())
+        with self._lock:
+            self._pending.append((ts, row))
+            if time.monotonic() - self._last_flush >= self.flush_s:
+                self._flush_locked()
+
+    def flush(self):
+        """Write queued samples to disk now."""
+        with self._lock:
+            self._flush_locked()
+
+    def _flush_locked(self):
+        self._last_flush = time.monotonic()
+        if not self._pending:
+            return
+        names = [name for name, _ in HISTORY_FIELDS]
+        try:
+            conn = self._connect()
+            try:
+                with conn:
+                    conn.executemany(
+                        f"INSERT OR REPLACE INTO samples (ts, {', '.join(names)}) "
+                        f"VALUES ({', '.join('?' * (len(names) + 1))})",
+                        [(ts, *(row.get(n) for n in names)) for ts, row in self._pending])
+                    now = time.time()
+                    if now - self._last_prune >= 86400:
+                        conn.execute("DELETE FROM samples WHERE ts < ?", (now - self.keep_s,))
+                        self._last_prune = now
+            finally:
+                conn.close()
+            self._pending.clear()
+        except (sqlite3.Error, OSError) as e:
+            # Keep the samples and try again next time; cap memory meanwhile.
+            del self._pending[:-1440]
+            warn("history", f"cannot write {self.path}: {e}")
+
+    def query(self, seconds, points=HISTORY_POINTS, now=None):
+        """Averages over `points` equal buckets covering the last `seconds`.
+
+        Returns {"start", "step", "fields": {name: [value or None, ...]}}.
+        Health is the worst value in each bucket rather than the average, so a
+        short fault still shows.
+        """
+        now = int(now if now is not None else time.time())
+        start = now - seconds
+        step = seconds / points
+        names = [name for name, _ in HISTORY_FIELDS]
+        rows = []
+        try:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    f"SELECT ts, {', '.join(names)} FROM samples WHERE ts >= ? ORDER BY ts",
+                    (start,)).fetchall()
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError) as e:
+            warn("history-read", f"cannot read {self.path}: {e}")
+        with self._lock:
+            rows += [(ts, *(row.get(n) for n in names))
+                     for ts, row in self._pending if ts >= start]
+        sums = [[0.0] * points for _ in names]
+        counts = [[0] * points for _ in names]
+        worst = [None] * points
+        health_col = names.index("health")
+        for ts, *values in rows:
+            b = min(points - 1, int((ts - start) / step))
+            for i, v in enumerate(values):
+                if v is None:
+                    continue
+                sums[i][b] += v
+                counts[i][b] += 1
+                if i == health_col:
+                    worst[b] = v if worst[b] is None else max(worst[b], v)
+        fields = {}
+        for i, name in enumerate(names):
+            if i == health_col:
+                fields[name] = worst
+            else:
+                fields[name] = [sums[i][b] / counts[i][b] if counts[i][b] else None
+                                for b in range(points)]
+        return {"start": start, "step": step, "fields": fields}
+
+
+HISTORY = HistoryStore()
+_history_cache = {}   # range name -> (monotonic time, response)
+
+
+def _history_recorder(interval=60):
+    """Add one sample a minute to HISTORY. Runs as a daemon thread."""
+    while True:
+        try:
+            HISTORY.add(history_sample(STATUS_CACHE.get()))
+        except Exception:  # noqa: BLE001 - the recorder must outlive any bug
+            log.exception("history: could not record a sample")
+        time.sleep(interval - time.time() % interval)
 
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -1183,6 +1419,17 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001 - see above
                 log.exception("could not build the health report")
                 self.send_json({"status": "ERROR"}, status=500)
+        elif path == "/api/history":
+            name = parse_qs(url.query).get("range", ["24h"])[0]
+            if name not in HISTORY_RANGES:
+                self.send_json({"error": f"range must be one of {', '.join(HISTORY_RANGES)}"},
+                               status=400)
+                return
+            cached = _history_cache.get(name)
+            if cached is None or time.monotonic() - cached[0] >= 60:
+                cached = (time.monotonic(), HISTORY.query(HISTORY_RANGES[name]))
+                _history_cache[name] = cached
+            self.send_json(dict(cached[1], range=name))
         elif path in ("/", "/index.html"):
             self._record_visitor()
             self._send_compressible(PAGE, "text/html; charset=utf-8", "no-store")
@@ -1208,6 +1455,10 @@ class DashboardServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+def _stop_on_sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main():
     """Parse the command line and serve until interrupted."""
     parser = argparse.ArgumentParser(description="Chrony GPS Dashboard - Space-Age")
@@ -1221,6 +1472,9 @@ def main():
     parser.add_argument("--trusted-proxy", action="append", default=[], metavar="IP",
                         help="reverse proxy whose X-Real-IP header gives the real "
                              "visitor address (repeatable)")
+    parser.add_argument("--state-dir", default=VISITOR_DATA_DIR, metavar="DIR",
+                        help="where visitor counts and history are kept "
+                             f"(default: {VISITOR_DATA_DIR})")
     parser.add_argument("--timezone", metavar="NAME",
                         help="IANA time zone for the header clock "
                              "(default: this server's, e.g. America/Los_Angeles)")
@@ -1229,15 +1483,24 @@ def main():
     CONFIG["pps_refid"] = args.pps_refid
     STATUS_CACHE.ttl = args.cache_ttl
     TRUSTED_PROXIES.update(args.trusted_proxy)
+    VISITORS.path = os.path.join(args.state_dir, os.path.basename(VISITOR_FILE))
+    HISTORY.path = os.path.join(args.state_dir, os.path.basename(HISTORY_FILE))
     load_page(tz=args.timezone)
     threading.Thread(target=_gps_monitor, name="gps-monitor", daemon=True).start()
+    threading.Thread(target=_history_recorder, name="history", daemon=True).start()
+    threading.Thread(target=_pps_poller, name="pps", daemon=True).start()
+    # systemd stops the service with SIGTERM: leave serve_forever the same
+    # way as Ctrl-C, so pending history is written below.
+    signal.signal(signal.SIGTERM, _stop_on_sigterm)
 
     server = DashboardServer((args.bind, args.port), Handler)
     log.info("listening on http://%s:%s", args.bind, args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        log.info("stopped")
+        log.info("stopping")
+    finally:
+        HISTORY.flush()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,26 @@
+// Automatic updates for the time server, in place of a nightly
+// "apt-get full-upgrade && reboot" cron job.
+//
+// - Only security updates from Debian, plus Raspberry Pi OS's own packages
+//   (kernel and firmware fixes arrive there). Everything else waits for a
+//   person to run apt.
+// - Reboot only when an update needs one (/var/run/reboot-required), at 03:30,
+//   instead of every night. Each reboot takes the server off GPS for a few
+//   minutes while the receiver and chrony settle.
+// - Changed config files are kept: an upgrade never replaces chrony.conf.
+// Replace (not add to) the list from Debian's 50unattended-upgrades.
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Debian,codename=${distro_codename},label=Debian-Security";
+        "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+        "origin=Raspberry Pi Foundation,codename=${distro_codename}";
+};
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "03:30";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Dpkg::Options {
+        "--force-confdef";
+        "--force-confold";
+};

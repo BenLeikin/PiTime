@@ -7,6 +7,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -277,6 +278,39 @@ class PpsHistoryTests(unittest.TestCase):
         self.assertTrue(all(s == 5e-08 for s in samples))
 
 
+class PpsSamplerTests(unittest.TestCase):
+    ROW = "#,*,PPS,0,4,377,{last_rx},{offset},0.000000020,0.000000101\n"
+
+    def poll(self, sampler, last_rx, offset, now):
+        out = self.ROW.format(last_rx=last_rx, offset=offset)
+        with mock.patch.object(cd, "run", fake_run({"sources": out})), \
+             mock.patch.object(cd.time, "time", return_value=now):
+            return sampler.poll("PPS")
+
+    def test_each_chrony_sample_is_taken_once(self):
+        sampler = cd.PpsSampler()
+        self.assertTrue(self.poll(sampler, 2, "0.000000012", 1000.0))   # taken at 998
+        self.assertFalse(self.poll(sampler, 6, "0.000000012", 1004.0))  # same sample
+        self.assertFalse(self.poll(sampler, 10, "0.000000012", 1008.3)) # still the same
+        self.assertTrue(self.poll(sampler, 2, "-0.000000040", 1016.0))  # next poll
+        self.assertEqual(sampler.history("PPS"), [1.2e-08, -4e-08])
+
+    def test_silent_source_adds_nothing(self):
+        sampler = cd.PpsSampler()
+        self.assertFalse(self.poll(sampler, 4294967295, "0.0", 1000.0))
+        with mock.patch.object(cd, "parse_pps_history", return_value=[1e-9]) as fallback:
+            self.assertEqual(sampler.history("PPS"), [1e-9])   # falls back to the log
+        fallback.assert_called_once_with("PPS")
+
+    def test_keeps_the_latest_sixty(self):
+        sampler = cd.PpsSampler()
+        for i in range(70):
+            self.poll(sampler, 1, f"{i}e-9", 1000.0 + 16 * i)
+        history = sampler.history("PPS")
+        self.assertEqual(len(history), 60)
+        self.assertAlmostEqual(history[-1], 69e-9)
+
+
 class FakeGpsd:
     """Minimal gpsd stand-in that answers ?WATCH/?POLL with canned JSON."""
 
@@ -368,6 +402,91 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(a["visitors"]["current"], 1)
         self.assertIsNot(a, b)
+
+
+class HistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "history.sqlite3")
+        self.addCleanup(lambda: [os.unlink(os.path.join(self.dir, n)) for n in os.listdir(self.dir)]
+                        and None or os.rmdir(self.dir))
+
+    def row(self, **values):
+        base = dict.fromkeys(name for name, _ in cd.HISTORY_FIELDS)
+        base.update(values)
+        return base
+
+    # Timestamps are recent: anything older than keep_days is pruned on write.
+    NOW = int(time.time())
+
+    def test_samples_are_written_in_batches(self):
+        store = cd.HistoryStore(path=self.path, flush_s=600)
+        store.add(self.row(sats_used=5), ts=self.NOW - 120)
+        store.add(self.row(sats_used=6), ts=self.NOW - 60)
+        self.assertFalse(os.path.exists(self.path))         # nothing written yet
+        # ...but queries already see them.
+        result = store.query(600, points=1, now=self.NOW)
+        self.assertEqual(result["fields"]["sats_used"], [5.5])
+        store.flush()
+        self.assertTrue(os.path.exists(self.path))
+        reopened = cd.HistoryStore(path=self.path)
+        self.assertEqual(reopened.query(600, points=1, now=self.NOW)["fields"]["sats_used"], [5.5])
+
+    def test_buckets_average_and_health_keeps_the_worst(self):
+        store = cd.HistoryStore(path=self.path, flush_s=0)
+        start = self.NOW - 240
+        for i, (health, temp) in enumerate([(0, 40.0), (2, 42.0), (0, 44.0), (1, 50.0)]):
+            store.add(self.row(health=health, temperature_c=temp), ts=start + i * 60)
+        result = store.query(240, points=2, now=self.NOW)
+        self.assertEqual(result["step"], 120)
+        self.assertEqual(result["fields"]["temperature_c"], [41.0, 47.0])
+        self.assertEqual(result["fields"]["health"], [2, 1])
+
+    def test_empty_buckets_are_none(self):
+        store = cd.HistoryStore(path=self.path, flush_s=0)
+        store.add(self.row(sats_used=4), ts=self.NOW - 400)
+        result = store.query(400, points=4, now=self.NOW)
+        self.assertEqual(result["fields"]["sats_used"], [4.0, None, None, None])
+
+    def test_old_rows_are_pruned(self):
+        store = cd.HistoryStore(path=self.path, keep_days=1, flush_s=0)
+        now = time.time()
+        store.add(self.row(sats_used=1), ts=now - 3 * 86400)
+        store._last_prune = 0.0
+        store.add(self.row(sats_used=2), ts=now)
+        result = store.query(5 * 86400, points=5, now=now)
+        self.assertEqual([v for v in result["fields"]["sats_used"] if v is not None], [2.0])
+
+    def test_unwritable_file_is_logged_and_samples_are_kept(self):
+        store = cd.HistoryStore(path="/nonexistent/dir/history.sqlite3", flush_s=0)
+        cd._warned.pop("history", None)
+        with self.assertLogs("chrony-dashboard", level="WARNING"):
+            store.add(self.row(sats_used=3), ts=self.NOW)
+        self.assertEqual(len(store._pending), 1)
+
+    def test_sample_from_a_snapshot(self):
+        snapshot = {
+            "tracking": {"stratum": "1", "last_offset_s": 1e-7, "rms_offset_s": 2e-7,
+                         "frequency_ppm": 8.7, "skew_ppm": 0.01},
+            "sources": [{"name": "PPS", "reach": "377", "offset_s": -4e-8},
+                        {"name": "NMEA", "reach": "377", "offset_s": 0.002}],
+            "system": {"temperature_c": 41.8},
+            "gps": {"available": True, "sats_used": 5, "sats_visible": 16,
+                    "best_snr": 27, "fix_mode": "3D"},
+            "health": {"status": "DEGRADED"},
+        }
+        row = cd.history_sample(snapshot)
+        self.assertEqual(row["stratum"], 1)
+        self.assertEqual(row["pps_offset_s"], -4e-8)
+        self.assertEqual(row["pps_reach"], 255)
+        self.assertEqual((row["fix"], row["health"]), (3, 1))
+        # A silent PPS has no offset worth plotting.
+        snapshot["sources"][0]["reach"] = "0"
+        self.assertIsNone(cd.history_sample(snapshot)["pps_offset_s"])
+        # Without gpsd, GPS fields are unknown rather than zero.
+        snapshot["gps"] = {"available": False}
+        row = cd.history_sample(snapshot)
+        self.assertEqual((row["sats_used"], row["best_snr"], row["fix"]), (None, None, None))
 
 
 class VersionTests(unittest.TestCase):
@@ -699,6 +818,17 @@ class HttpTests(unittest.TestCase):
         for path in ("/static/index.html", "/static/../chrony_dashboard.py",
                      "/static/", "/chrony_dashboard.py", "/nope"):
             self.assertEqual(self.get(path)[0], 404, path)
+
+    def test_history_endpoint(self):
+        with mock.patch.object(cd.HISTORY, "query",
+                               lambda seconds: {"start": 0, "step": seconds / 360,
+                                                "fields": {"health": [0] * 360}}):
+            cd._history_cache.clear()
+            status, _, body = self.get("/api/history?range=7d")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["range"], "7d")
+            self.assertEqual(json.loads(body)["step"], 7 * 86400 / 360)
+            self.assertEqual(self.get("/api/history?range=1y")[0], 400)
 
     def test_health_strict_mode_uses_the_http_status(self):
         status, _, body = self.get("/api/health")

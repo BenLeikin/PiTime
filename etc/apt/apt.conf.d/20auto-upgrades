@@ -1,0 +1,6 @@
+// Let apt's daily timers fetch package lists and run unattended-upgrades.
+// What gets upgraded, and when the Pi may reboot, is in
+// 52timeserver-unattended-upgrades.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";

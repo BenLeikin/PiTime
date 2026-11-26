@@ -51,7 +51,8 @@ install_config() {
     # Some directories run or load every file in them, backups included
     # (NetworkManager's dispatcher.d, chrony's conf.d), so keep those elsewhere.
     case "$dst" in
-      */dispatcher.d/*|*/conf.d/*) bak="/root/$(basename "$dst").bak-$STAMP" ;;
+      */dispatcher.d/*|*/conf.d/*|*/apt.conf.d/*|*/system.conf.d/*)
+        bak="/root/$(basename "$dst").bak-$STAMP" ;;
     esac
     cp -a "$dst" "$bak"
     echo "    backup:    $bak"
@@ -143,6 +144,23 @@ if [[ $WITH_CONFIGS -eq 1 ]]; then
     /etc/systemd/system/timeserver-tune.service || true
   systemctl daemon-reload
   systemctl enable timeserver-tune.service >/dev/null 2>&1
+  # Hardware watchdog: systemd reads its own config only on (re)execution.
+  if install_config etc/systemd/system.conf.d/90-timeserver-watchdog.conf \
+      /etc/systemd/system.conf.d/90-timeserver-watchdog.conf; then
+    systemctl daemon-reexec
+  fi
+  # Automatic security updates, rebooting only when needed.
+  install_config etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/20auto-upgrades || true
+  install_config etc/apt/apt.conf.d/52timeserver-unattended-upgrades \
+    /etc/apt/apt.conf.d/52timeserver-unattended-upgrades || true
+  if ! dpkg -s unattended-upgrades >/dev/null 2>&1; then
+    echo "    NOTE: automatic updates need: apt install unattended-upgrades"
+  fi
+  if crontab -l 2>/dev/null | grep -q "full-upgrade.*reboot"; then
+    echo "    NOTE: root's crontab still has a nightly upgrade-and-reboot job;"
+    echo "          remove it (sudo crontab -e) - unattended-upgrades replaces it"
+  fi
+
   # Only where a GitLab runner is installed on this machine: keep its jobs
   # out of the way of timekeeping.
   if systemctl cat gitlab-runner.service >/dev/null 2>&1; then

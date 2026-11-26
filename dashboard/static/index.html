@@ -125,6 +125,43 @@
         <div class="stat-row"><span class="stat-key">PPS IRQ Total</span><span class="stat-val amber" id="pps-irq">—</span></div>
       </div>
 
+    <div class="section-heading"><span class="marker">&#9658;</span><span>History</span></div>
+
+    <div class="card full">
+      <div class="history-head">
+        <div class="card-title">History</div>
+        <div class="range-buttons" id="history-range">
+          <button type="button" data-range="6h">6 h</button>
+          <button type="button" data-range="24h" class="active">24 h</button>
+          <button type="button" data-range="7d">7 d</button>
+          <button type="button" data-range="30d">30 d</button>
+        </div>
+      </div>
+      <div class="history-grid">
+        <div class="history-panel">
+          <div class="history-title">Clock offset</div>
+          <svg class="history-chart" id="hist-offset" preserveAspectRatio="none"></svg>
+          <div class="history-legend" id="hist-offset-legend"></div>
+        </div>
+        <div class="history-panel">
+          <div class="history-title">Frequency and temperature</div>
+          <svg class="history-chart" id="hist-freq" preserveAspectRatio="none"></svg>
+          <div class="history-legend" id="hist-freq-legend"></div>
+        </div>
+        <div class="history-panel">
+          <div class="history-title">GPS reception</div>
+          <svg class="history-chart" id="hist-gps" preserveAspectRatio="none"></svg>
+          <div class="history-legend" id="hist-gps-legend"></div>
+        </div>
+        <div class="history-panel">
+          <div class="history-title">Health</div>
+          <svg class="history-band" id="hist-health" preserveAspectRatio="none"></svg>
+          <div class="history-legend" id="hist-health-legend"></div>
+        </div>
+      </div>
+      <div class="history-axis"><span id="hist-start">&mdash;</span><span id="hist-note"></span><span>now</span></div>
+    </div>
+
     <div class="section-heading"><span class="marker">&#9658;</span><span>System Telemetry</span></div>
 
     <div class="grid-2">

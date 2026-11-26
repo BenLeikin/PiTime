@@ -274,7 +274,7 @@ function drawSparkline(values) {
     text.setAttribute('fill', '#4a6080');
     text.setAttribute('font-family', 'Space Mono');
     text.setAttribute('font-size', '10');
-    text.textContent = 'NO DATA - enable: log refclocks in chrony.conf';
+    text.textContent = 'COLLECTING - chrony makes one PPS sample every poll';
     svg.appendChild(text);
     return;
   }
@@ -832,6 +832,182 @@ function generateFunFact(d) {
   return facts[Math.floor(Math.random() * facts.length)];
 }
 
+// ============================================================================
+// History charts: /api/history returns averages over equal time buckets; the
+// charts are drawn as plain SVG so the page needs no chart library.
+// ============================================================================
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const HISTORY_REFRESH_MS = 5 * 60 * 1000;
+const HEALTH_COLORS = ['#00ff88', '#ffd700', '#ff3355'];   // OK, DEGRADED, FAULT
+let historyRange = '24h';
+
+function svgEl(name, attrs) {
+  const el = document.createElementNS(SVG_NS, name);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+}
+
+// The lowest and highest non-null value across several series, or null.
+// With `robust`, the 2nd and 98th percentiles instead, so one spike (a
+// restart, a moment off GPS) does not flatten everything else into a line;
+// values beyond them are drawn at the edge.
+function seriesRange(lists, robust) {
+  const all = [];
+  for (const values of lists) for (const v of values) if (v != null) all.push(v);
+  if (all.length === 0) return null;
+  all.sort((a, b) => a - b);
+  const pick = q => all[Math.min(all.length - 1, Math.floor(q * all.length))];
+  let lo = robust && all.length >= 20 ? pick(0.02) : all[0];
+  let hi = robust && all.length >= 20 ? pick(0.98) : all[all.length - 1];
+  if (lo === hi) { lo -= 1e-9 + Math.abs(lo) * 0.05; hi += 1e-9 + Math.abs(hi) * 0.05; }
+  const margin = (hi - lo) * 0.08;
+  return [lo - margin, hi + margin];
+}
+
+// SVG path for one series, broken wherever a bucket has no data.
+function linePath(values, w, h, lo, hi, pad) {
+  const stepX = values.length > 1 ? w / (values.length - 1) : w;
+  let d = '';
+  let pen = false;
+  values.forEach((v, i) => {
+    if (v == null) { pen = false; return; }
+    const x = (i * stepX).toFixed(1);
+    const clipped = Math.min(hi, Math.max(lo, v));
+    const y = (pad + (h - 2 * pad) * (1 - (clipped - lo) / (hi - lo))).toFixed(1);
+    d += (pen ? 'L' : 'M') + x + ',' + y + ' ';
+    pen = true;
+  });
+  return d;
+}
+
+// The plain lowest and highest values of one series, for its legend.
+function minMax(values) {
+  const known = values.filter(v => v != null);
+  return known.length ? [Math.min(...known), Math.max(...known)] : null;
+}
+
+function lastValue(values) {
+  for (let i = values.length - 1; i >= 0; i--) if (values[i] != null) return values[i];
+  return null;
+}
+
+// Draw a chart of up to a few series. Each series: {values, color, label,
+// format, axis, robust}. Series on the same axis ('left' or 'right') share a
+// scale; `robust` scales that axis to the 2nd-98th percentile.
+function drawHistoryChart(id, series) {
+  const svg = document.getElementById(id);
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  const rect = svg.getBoundingClientRect();
+  const w = rect.width || 600;
+  const h = rect.height || 120;
+  const pad = 6;
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  for (let i = 1; i < 4; i++) {
+    const y = pad + (h - 2 * pad) * i / 4;
+    svg.appendChild(svgEl('line', { x1: 0, x2: w, y1: y, y2: y,
+      stroke: 'rgba(45,74,120,0.3)', 'stroke-dasharray': '2,3' }));
+  }
+  const legend = document.getElementById(id + '-legend');
+  legend.textContent = '';
+  let drew = false;
+  for (const axis of ['left', 'right']) {
+    const group = series.filter(s => (s.axis || 'left') === axis);
+    const range = seriesRange(group.map(s => s.values), group.some(s => s.robust));
+    if (!range) continue;
+    for (const s of group) {
+      svg.appendChild(svgEl('path', { d: linePath(s.values, w, h, range[0], range[1], pad),
+        fill: 'none', stroke: s.color, 'stroke-width': 1.4, 'vector-effect': 'non-scaling-stroke' }));
+      drew = true;
+    }
+  }
+  for (const s of series) {
+    const item = document.createElement('span');
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = s.color;
+    item.appendChild(swatch);
+    const now = lastValue(s.values);
+    const range = minMax(s.values);
+    item.appendChild(document.createTextNode(
+      `${s.label} ${now == null ? '—' : s.format(now)}` +
+      (range ? ` (${s.format(range[0])} – ${s.format(range[1])})` : '')));
+    legend.appendChild(item);
+  }
+  if (!drew) {
+    svg.appendChild(svgEl('text', { x: '50%', y: '50%', 'text-anchor': 'middle',
+      fill: '#4a6080', 'font-size': 10, 'font-family': 'Space Mono' }))
+      .textContent = 'NO DATA YET - one sample is recorded each minute';
+  }
+}
+
+// Health as a coloured band: one block per bucket, empty where nothing was recorded.
+function drawHealthBand(id, values) {
+  const svg = document.getElementById(id);
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  const rect = svg.getBoundingClientRect();
+  const w = rect.width || 600;
+  const h = rect.height || 22;
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  const bw = w / values.length;
+  const time = [0, 0, 0];
+  values.forEach((v, i) => {
+    if (v == null) return;
+    time[v] += 1;
+    svg.appendChild(svgEl('rect', { x: (i * bw).toFixed(2), y: 0,
+      width: (bw + 0.6).toFixed(2), height: h, fill: HEALTH_COLORS[v], opacity: 0.75 }));
+  });
+  const recorded = time[0] + time[1] + time[2];
+  const legend = document.getElementById(id + '-legend');
+  legend.textContent = recorded === 0 ? 'no data yet' : ['OK', 'DEGRADED', 'FAULT']
+    .map((name, i) => `${name} ${Math.round(100 * time[i] / recorded)}%`).join('  ◆  ');
+}
+
+function rangeLabel(seconds) {
+  return seconds >= 86400 ? `${Math.round(seconds / 86400)} d ago` : `${Math.round(seconds / 3600)} h ago`;
+}
+
+function renderHistory(h) {
+  const f = h.fields;
+  const ns = v => formatSecondsAsHuman(v);
+  drawHistoryChart('hist-offset', [
+    { values: f.pps_offset_s, color: '#00d4ff', label: 'PPS', format: ns, robust: true },
+    { values: f.last_offset_s, color: '#ffaa00', label: 'clock correction', format: ns,
+      axis: 'right', robust: true },
+  ]);
+  drawHistoryChart('hist-freq', [
+    { values: f.frequency_ppm, color: '#00ff88', label: 'frequency', format: v => v.toFixed(3) + ' ppm' },
+    { values: f.temperature_c, color: '#ffaa00', label: 'CPU', format: v => v.toFixed(1) + ' °C', axis: 'right' },
+  ]);
+  drawHistoryChart('hist-gps', [
+    { values: f.sats_used, color: '#00ff88', label: 'satellites used', format: v => v.toFixed(1) },
+    { values: f.best_snr, color: '#00d4ff', label: 'best signal', format: v => v.toFixed(0) + ' dB-Hz', axis: 'right' },
+  ]);
+  drawHealthBand('hist-health', f.health);
+  setText('hist-start', rangeLabel(h.step * f.health.length));
+  setText('hist-note', `${h.range} ◆ averages over ${formatDuration(h.step)} each`);
+}
+
+async function fetchHistory() {
+  try {
+    const res = await fetch('/api/history?range=' + encodeURIComponent(historyRange),
+                            { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    renderHistory(await res.json());
+  } catch (e) {
+    setText('hist-note', 'history unavailable');
+    console.error(e);
+  }
+}
+
+document.querySelectorAll('#history-range button').forEach(button => {
+  button.addEventListener('click', () => {
+    historyRange = button.dataset.range;
+    document.querySelectorAll('#history-range button')
+      .forEach(b => b.classList.toggle('active', b === button));
+    fetchHistory();
+  });
+});
+
 let prog = document.getElementById('refresh-progress');
 function startProgress() {
   prog.style.transition = 'none';
@@ -878,6 +1054,13 @@ const GLOSSARY = {
   'Range': 'Difference between Min and Max. A small range indicates a stable PPS source.',
   'Sample count': 'Number of recent PPS samples included in this view.',
   'PPS IRQ Total': 'Total count of PPS hardware interrupts received since boot. One pulse per second when GPS is locked.',
+
+  // History
+  'History': 'One sample is recorded every minute and kept for 30 days. Each point on a chart is the average over a slice of the chosen range; gaps mean nothing was recorded (the dashboard or the Pi was down).',
+  'Clock offset': 'PPS: how far each GPS pulse was from the system clock. Clock correction: the adjustment chrony made at each update. Both should hover around zero.',
+  'Frequency and temperature': 'How fast the uncorrected crystal runs (chrony cancels this) next to the CPU temperature. The frequency follows temperature; this is what temperature compensation removes.',
+  'GPS reception': 'Satellites in the fix and the strongest signal among them. A falling signal warns of a lost fix before it happens.',
+  'Health': 'The dashboard status over time: green OK, yellow DEGRADED, red FAULT.',
 
   // Tracking detail
   'Tracking Detail': 'Detailed metrics from "chronyc tracking" describing your synchronization state.',
@@ -983,7 +1166,7 @@ function _hideTip() {
 function attachTooltips(root) {
   root = root || document;
   // Selectors covering every kind of label that should be hoverable
-  const selectors = ['.stat-key', '.card-title', '.header-meta dt', 'th', '.hero-stat .lbl'];
+  const selectors = ['.stat-key', '.card-title', '.header-meta dt', 'th', '.hero-stat .lbl', '.history-title'];
   const nodes = root.querySelectorAll(selectors.join(','));
   nodes.forEach(el => {
     if (el.dataset.tipBound) return;
@@ -1048,3 +1231,5 @@ updateWorldClock();
 attachTooltips();
 fetchData();
 setInterval(fetchData, REFRESH_S * 1000);
+fetchHistory();
+setInterval(fetchHistory, HISTORY_REFRESH_MS);

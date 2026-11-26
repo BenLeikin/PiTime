@@ -35,6 +35,10 @@ DEFAULTS = {
     "NAME": "time server",
     "HEALTH_URL": "http://127.0.0.1:8080/api/health",
     "NTP_HOST": "",              # also query NTP on this host; empty = skip
+    # Outside NTP servers to compare the time server with. Empty = skip.
+    # Avoid servers that smear leap seconds (Google's, for one).
+    "REFERENCES": "time.cloudflare.com pool.ntp.org",
+    "MAX_DISAGREE_MS": "10",     # alert if the server is further than this from them
     "WEBHOOK_URL": "",           # empty = log only
     "THRESHOLD": "3",            # runs a change must last before notifying
     "REMIND_HOURS": "24",        # repeat the alert this often while unhealthy
@@ -78,35 +82,83 @@ def check_health(url, timeout=10):
     return state, [str(i) for i in report.get("issues", [])]
 
 
-def check_ntp(host, timeout=5):
-    """None if the NTP service answers sensibly, else a description of what is wrong."""
-    request = b"\x23" + 47 * b"\x00"   # version 4, client mode
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(timeout)
-            s.sendto(request, (host, 123))
-            reply, _ = s.recvfrom(512)
-    except OSError as e:
-        return f"NTP did not answer: {e}"
+def _ntp_time(raw):
+    """Seconds since 1970 from a 64-bit NTP timestamp."""
+    seconds, fraction = struct.unpack("!II", raw)
+    return seconds - NTP_EPOCH_OFFSET + fraction / 2**32
+
+
+def ntp_query(host, timeout=5):
+    """Ask one NTP server for the time.
+
+    Returns {"offset", "delay", "stratum", "leap"}: offset is how far the
+    server's clock is from this machine's (positive = server ahead), worked
+    out from the four timestamps of the exchange as NTP clients do, so the
+    network delay mostly cancels out. Raises OSError if there is no usable
+    answer.
+    """
+    request = bytearray(48)
+    request[0] = 0x23                     # version 4, client mode
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        t1 = time.time()
+        s.sendto(bytes(request), (host, 123))
+        reply, _ = s.recvfrom(512)
+        t4 = time.time()
     if len(reply) < 48:
-        return "NTP sent a short reply"
-    leap = reply[0] >> 6
-    stratum = reply[1]
-    transmit = struct.unpack("!I", reply[40:44])[0] - NTP_EPOCH_OFFSET
-    if stratum == 0 or stratum > 15 or leap == 3:
-        return "NTP says it is not synchronised"
-    if abs(transmit - time.time()) > 5:
-        return f"NTP time differs from this machine's by {transmit - time.time():+.0f} s"
-    return None
+        raise OSError("short reply")
+    t2, t3 = _ntp_time(reply[32:40]), _ntp_time(reply[40:48])
+    return {"offset": ((t2 - t1) + (t3 - t4)) / 2,
+            "delay": (t4 - t1) - (t3 - t2),
+            "stratum": reply[1],
+            "leap": reply[0] >> 6}
+
+
+def check_ntp(host, references=(), max_disagree_s=0.010, query=ntp_query):
+    """Problems with the time server's NTP service, as a list of descriptions.
+
+    Checks that it answers and says it is synchronised. With `references`,
+    also compares its time with theirs: this machine's own clock cancels out,
+    so the check is independent of both the time server's health report and
+    this machine's clock.
+    """
+    try:
+        server = query(host)
+    except OSError as e:
+        return [f"NTP did not answer: {getattr(e, 'reason', e) or 'timed out'}"]
+    if server["stratum"] == 0 or server["stratum"] > 15 or server["leap"] == 3:
+        return ["NTP says it is not synchronised"]
+    others = []
+    for ref in references:
+        try:
+            answer = query(ref)
+        except OSError:
+            continue
+        if 0 < answer["stratum"] <= 15 and answer["leap"] != 3:
+            others.append(answer)
+    if not others:
+        return []   # no outside opinion this time; nothing to compare with
+    others.sort(key=lambda a: a["offset"])
+    middle = others[len(others) // 2]
+    difference = server["offset"] - middle["offset"]
+    # A single exchange can be wrong by up to half its round trip (the path
+    # out and back may differ), so allow for both measurements' share of that
+    # on top of the configured margin. Over Wi-Fi that is several ms.
+    allowed = max_disagree_s + (server["delay"] + middle["delay"]) / 2
+    if abs(difference) > allowed:
+        servers = f"{len(others)} outside server{'s' if len(others) > 1 else ''}"
+        return [f"NTP time is {difference * 1000:+.1f} ms from {servers}"]
+    return []
 
 
 def observe(config):
     """The server's state right now, as (state, issues)."""
     state, issues = check_health(config["HEALTH_URL"])
     if config["NTP_HOST"]:
-        problem = check_ntp(config["NTP_HOST"])
-        if problem:
-            issues.append(problem)
+        problems = check_ntp(config["NTP_HOST"], config["REFERENCES"].split(),
+                             float(config["MAX_DISAGREE_MS"]) / 1000)
+        if problems:
+            issues.extend(problems)
             if state == OK:
                 state = "FAULT"
     return state, issues

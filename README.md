@@ -141,6 +141,8 @@ Everything specific to one site (who may use the server, the NTS host name, the 
 | `etc/sysctl.d/90-timeserver-failover.conf` | `/etc/sysctl.d/` | Only the preferred link answers ARP |
 | `usr/local/sbin/timeserver-tune` | `/usr/local/sbin/` | Boot-time low-jitter settings: fixed CPU speed, other interrupts off the PPS CPU, GPS stationary mode |
 | `systemd/timeserver-tune.service` | `/etc/systemd/system/` | Runs `timeserver-tune` at boot |
+| `etc/systemd/system.conf.d/90-timeserver-watchdog.conf` | `/etc/systemd/system.conf.d/` | Hardware watchdog: reboots the Pi if it hangs |
+| `etc/apt/apt.conf.d/20auto-upgrades`, `52timeserver-unattended-upgrades` | `/etc/apt/apt.conf.d/` | Automatic security updates; reboot only when one needs it |
 | `etc/udev/rules.d/99-pps.rules` | `/etc/udev/rules.d/` | Makes `/dev/pps*` readable without root (copy by hand) |
 | `etc/linuxptp/ptp4l.conf`, `systemd/ptp4l.service` | `/etc/linuxptp/`, `/etc/systemd/system/` | Optional PTP master (copy by hand) |
 | `install.sh` | – | Installs on the Pi (run as root) |
@@ -204,9 +206,10 @@ treated as public.
 
 Problems reading chrony, gpsd or `/proc` are written to the journal
 (`journalctl -u chrony-webpage`), once and then at most every five minutes
-each. The PPS jitter chart reads `/var/log/chrony/refclocks.log`, so
-`log refclocks` must be enabled in `chrony.conf`. Visitor counts are kept in
-`/var/lib/chrony-dashboard/visitors.json`.
+each. The PPS chart collects chrony's PPS samples itself (one per poll), so it needs
+no refclocks log; it fills in over its first 16 minutes. Visitor counts and
+the history behind the charts (one sample a minute, kept 30 days, written to
+disk every 10 minutes) are in `/var/lib/chrony-dashboard/`.
 
 ## Monitoring
 
@@ -223,7 +226,10 @@ sudo timeserver-monitor --test                 # sends a test message
 echo '*/5 * * * * root /usr/local/bin/timeserver-monitor' | sudo tee /etc/cron.d/timeserver-monitor
 ```
 
-Every run reads `/api/health` and asks the NTP service itself for the time.
+Every run reads `/api/health`, asks the NTP service itself for the time, and
+compares that time with two outside servers. The comparison does not depend on
+the Pi's own health report or the monitoring machine's clock, so it catches a
+server that is confidently wrong, such as one locked to the wrong second.
 A change is reported once it has lasted three runs, so restarts stay quiet;
 recovery is reported too, and a lasting problem is repeated daily. The
 webhook can be Discord, Slack, Mattermost or Google Chat.
@@ -248,6 +254,28 @@ clients could send requests over Wi-Fi and get replies by cable, which skews
 their measured offset. Expect NTP clients to see millisecond-level jitter
 while the Pi is on Wi-Fi. The Pi's own clock stays PPS-disciplined either way.
 
+## History
+
+The dashboard records one sample a minute (offsets, frequency, temperature,
+satellites, signal, health), keeps 30 days, and draws them in the History
+section for the last 6 hours to 30 days. Samples are written to disk every
+10 minutes to spare the SD card. `GET /api/history?range=6h|24h|7d|30d`
+returns the same data as JSON.
+
+## Keeping the Pi healthy
+
+- **SD card wear.** chrony logs only `tracking` and `tempcomp`, which the
+  temperature fit needs. The busier logs (`measurements`, `statistics`,
+  `refclocks`) were most of the card's writes, and nothing reads them; turn
+  them back on in `chrony.conf` when debugging.
+- **Updates.** `unattended-upgrades` installs security updates from Debian
+  and Raspberry Pi OS's own packages, and reboots at 03:30 only when an update
+  needs it. Install it with `sudo apt install unattended-upgrades`; the
+  settings are in `etc/apt/apt.conf.d/`. Upgrades never replace a changed
+  config file.
+- **Watchdog.** systemd keeps the Pi's hardware watchdog fed. If the system
+  hangs, the watchdog reboots it within 15 seconds.
+
 ## Tuning and temperature compensation
 
 `timeserver-tune` runs at boot (installed with `--configs`) and:
@@ -257,7 +285,8 @@ while the Pi is on Wi-Fi. The Pi's own clock stays PPS-disciplined either way.
 - moves every interrupt that can be moved off CPU 0 (and off any isolated
   core). The PPS pin's interrupt is always serviced on CPU 0 and cannot be
   moved, so this leaves CPU 0 to it;
-- puts the u-blox receiver in its stationary model.
+- puts the u-blox receiver in its stationary model and its serial port at
+  115200 baud, so NMEA arrives 0.07 s after the second instead of 0.13 s.
 
 On my Pi this roughly halved the spread of PPS offsets.
 

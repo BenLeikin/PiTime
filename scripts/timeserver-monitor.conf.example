@@ -12,6 +12,15 @@ HEALTH_URL=http://YOUR_TIME_SERVER_IP:8080/api/health
 # Also ask the NTP service itself for the time. Leave empty to skip.
 NTP_HOST=YOUR_TIME_SERVER_IP
 
+# Outside NTP servers to compare the time server's time with, separated by
+# spaces. Their median is the reference; an alert goes out if the time server
+# is further than MAX_DISAGREE_MS from it, plus half of each measurement's
+# round trip (the most network asymmetry can account for). This catches a server that is
+# confidently wrong (locked to the wrong second, say), which its own health
+# report cannot. Leave empty to skip. Avoid servers that smear leap seconds.
+REFERENCES="time.cloudflare.com pool.ntp.org"
+MAX_DISAGREE_MS=10
+
 # Where alerts go: a Discord, Slack, Mattermost or Google Chat incoming
 # webhook. Leave empty to only log (cron mails the output).
 WEBHOOK_URL=
