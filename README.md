@@ -53,6 +53,24 @@ ppstest /dev/pps0      # one pulse per second
 curl -s localhost:8080/api/health
 ```
 
+## Wired + Wi-Fi failover
+
+The wired (`end0`) and Wi-Fi (`wlan0`) NetworkManager profiles both carry the
+same static address, so DNS, port forwards and clients never change. Route
+metrics make the cable preferred whenever it is plugged in:
+
+```bash
+S="ipv4.method manual ipv4.addresses 10.0.0.16/22 ipv4.gateway 10.0.0.1 ipv4.dns 10.0.0.13 ipv4.dns-search pilg0re.net"
+sudo nmcli con mod "Wired connection 1" $S ipv4.route-metric 100
+sudo nmcli con mod <wifi-profile> $S ipv4.route-metric 600 802-11-wireless.powersave 2
+```
+
+`etc/NetworkManager/dispatcher.d/50-link-failover-garp` (installed with
+`--configs`) sends gratuitous ARPs from whichever interface takes over, so
+other machines switch to its MAC address within seconds. Expect NTP clients to
+see millisecond-level jitter while the Pi is on Wi-Fi. The Pi's own clock
+stays PPS-disciplined either way.
+
 ## Deploying updates from a workstation
 
 Add an SSH alias for the Pi to `~/.ssh/config`:

@@ -31,18 +31,21 @@ fi
 log() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
-# install_config <repo path> <system path>: copy only if different, keep a backup.
+# install_config <repo path> <system path> [mode]: copy only if different, keep a backup.
 install_config() {
-  local src="$SRC/$1" dst="$2"
+  local src="$SRC/$1" dst="$2" mode="${3:-0644}"
   if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
     echo "    unchanged: $dst"
     return 1
   fi
   if [[ -f "$dst" ]]; then
-    cp -a "$dst" "$dst.bak-$STAMP"
-    echo "    backup:    $dst.bak-$STAMP"
+    local bak="$dst.bak-$STAMP"
+    # NetworkManager would run a backup left in dispatcher.d as a script.
+    [[ "$dst" == */dispatcher.d/* ]] && bak="/root/$(basename "$dst").bak-$STAMP"
+    cp -a "$dst" "$bak"
+    echo "    backup:    $bak"
   fi
-  install -D -m 0644 "$src" "$dst"
+  install -D -m "$mode" "$src" "$dst"
   echo "    updated:   $dst"
   return 0
 }
@@ -69,6 +72,8 @@ if [[ $WITH_CONFIGS -eq 1 ]]; then
   if install_config etc/default/gpsd /etc/default/gpsd; then
     RESTART_GPSD=1
   fi
+  install_config etc/NetworkManager/dispatcher.d/50-link-failover-garp \
+    /etc/NetworkManager/dispatcher.d/50-link-failover-garp 0755 || true
   if install_config boot/firmware/config.txt /boot/firmware/config.txt; then
     echo "    NOTE: config.txt changed - reboot the Pi for it to take effect"
   fi

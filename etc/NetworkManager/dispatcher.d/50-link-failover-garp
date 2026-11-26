@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""NetworkManager dispatcher: re-announce the server's address after a link change.
+
+The wired (end0) and Wi-Fi (wlan0) profiles both carry the same static
+address, with the wired one preferred by route metric. When the cable is
+unplugged or plugged back in, other machines still have the old interface's
+MAC address cached. A few gratuitous ARPs from the interface that now holds
+the default route update them, so failover takes seconds instead of waiting
+out ARP caches (which can be many minutes on routers).
+
+NetworkManager calls this as: <script> <interface> <action>
+"""
+
+import json
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+IFACES = ("end0", "wlan0")
+ACTIONS = ("up", "down", "dhcp4-change")
+
+
+def _ip_json(*args):
+    out = subprocess.run(["ip", "-j", *args], capture_output=True, text=True).stdout
+    return json.loads(out or "[]")
+
+
+def active_iface():
+    """The watched interface whose default route has the lowest metric."""
+    routes = [r for r in _ip_json("-4", "route", "show", "default")
+              if r.get("dev") in IFACES]
+    if not routes:
+        return None
+    return min(routes, key=lambda r: r.get("metric", 0))["dev"]
+
+
+def ipv4_addresses(iface):
+    return [a["local"]
+            for link in _ip_json("-4", "addr", "show", "dev", iface)
+            for a in link.get("addr_info", [])
+            if a.get("scope") == "global"]
+
+
+def gratuitous_arp(iface, ip, count=3, interval=0.5):
+    mac = bytes.fromhex(open(f"/sys/class/net/{iface}/address").read()
+                        .strip().replace(":", ""))
+    addr = socket.inet_aton(ip)
+    # ARP request with sender == target address (the form `arping -U` sends).
+    arp = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 1,
+                      mac, addr, b"\x00" * 6, addr)
+    frame = (b"\xff" * 6 + mac + struct.pack("!H", 0x0806) + arp).ljust(60, b"\x00")
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as s:
+        s.bind((iface, 0))
+        for i in range(count):
+            s.send(frame)
+            if i < count - 1:
+                time.sleep(interval)
+
+
+def main(argv):
+    if len(argv) < 3 or argv[1] not in IFACES or argv[2] not in ACTIONS:
+        return 0
+    time.sleep(1)  # let routes settle after the change
+    iface = active_iface()
+    if not iface:
+        return 0
+    for ip in ipv4_addresses(iface):
+        gratuitous_arp(iface, ip)
+        print(f"announced {ip} on {iface} after {argv[1]} {argv[2]}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
