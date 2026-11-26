@@ -1,12 +1,46 @@
 [Unit]
 Description=Chrony GPS Dashboard
-After=network.target chrony.service
+After=network-online.target chrony.service gpsd.service
+Wants=network-online.target
 
 [Service]
 ExecStart=/usr/bin/python3 /opt/chrony-dashboard/chrony_dashboard.py --port 8080
 Restart=always
-User=root
+RestartSec=3
 WorkingDirectory=/opt/chrony-dashboard
+
+# Run as chrony's own user instead of root. That user can use chronyd's Unix
+# command socket, which the Clients and Server Stats panels need.
+User=_chrony
+Group=_chrony
+# Owned by the service user; holds visitors.json.
+StateDirectory=chrony-dashboard
+StateDirectoryMode=0750
+
+# Sandboxing
+NoNewPrivileges=yes
+ProtectSystem=strict
+# chronyc creates its client socket next to chronyd's.
+ReadWritePaths=/run/chrony
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target
