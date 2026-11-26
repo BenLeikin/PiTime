@@ -1,0 +1,52 @@
+#!/bin/bash
+# Low-jitter settings for the time server. Run at boot by
+# timeserver-tune.service; safe to run again by hand. Nothing here survives a
+# reboot by itself, so undoing it is: disable the service and reboot.
+set -u
+
+# CPUs that take the ordinary interrupts. Not CPU 0 (see below) and not the
+# core reserved with isolcpus= in cmdline.txt.
+OTHER_CPUS="${OTHER_CPUS:-1-2}"
+OTHER_CPUS_MASK="${OTHER_CPUS_MASK:-6}"
+GPSD_DEVICE="${GPSD_DEVICE:-localhost:2947:/dev/serial0}"
+
+log() { echo "timeserver-tune: $*"; }
+
+# 1. Run the CPU at a fixed speed. With the default "ondemand" governor the
+#    speed (and so the delay before a PPS pulse is timestamped, and the board
+#    temperature) changes with load.
+for gov in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
+  [ -w "$gov" ] || continue
+  echo performance > "$gov" && log "CPU governor: $(cat "$gov")"
+done
+
+# 2. Give the PPS interrupt a CPU to itself. The PPS pin's interrupt is chained
+#    behind the GPIO controller, which Linux always services on CPU 0 and does
+#    not let us move. So move every interrupt that can be moved (network, SD
+#    card and Wi-Fi, serial port...) to the other CPUs instead.
+pps_irq="$(awk '/pps/ { sub(":", "", $1); print $1; exit }' /proc/interrupts)"
+moved=0
+for dir in /proc/irq/[0-9]*; do
+  [ "${dir##*/}" = "$pps_irq" ] && continue
+  # Per-CPU interrupts (timers) refuse this; that is expected.
+  if echo "$OTHER_CPUS" > "$dir/smp_affinity_list" 2>/dev/null; then
+    moved=$((moved + 1))
+  fi
+done
+echo "$OTHER_CPUS_MASK" > /proc/irq/default_smp_affinity 2>/dev/null
+log "moved $moved interrupts to CPUs $OTHER_CPUS (PPS is irq ${pps_irq:-not found}, on CPU 0)"
+
+# 3. Tell the GPS its antenna does not move (u-blox dynamic model 2,
+#    "stationary"), which steadies its timing. The setting is not stored in the
+#    module, so it is sent on every boot once gpsd is answering.
+if command -v ubxtool >/dev/null; then
+  for _ in $(seq 1 30); do
+    if timeout 8 ubxtool -p MODEL,2 "$GPSD_DEVICE" 2>/dev/null | grep -q "ACK-ACK"; then
+      log "GPS dynamic model: stationary"
+      exit 0
+    fi
+    sleep 2
+  done
+  log "GPS did not acknowledge the stationary model (is gpsd running?)"
+  exit 1
+fi

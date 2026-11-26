@@ -25,6 +25,8 @@ receiver's PPS pulse, and a web dashboard shows its live state.
 | `boot/firmware/config.txt` | `/boot/firmware/` | Enables UART, disables Bluetooth, PPS on GPIO 18 |
 | `etc/NetworkManager/dispatcher.d/50-link-failover-garp` | `/etc/NetworkManager/dispatcher.d/` | Announces the address when the active link changes |
 | `etc/sysctl.d/90-timeserver-failover.conf` | `/etc/sysctl.d/` | Only the preferred link answers ARP |
+| `usr/local/sbin/timeserver-tune` | `/usr/local/sbin/` | Boot-time low-jitter settings: fixed CPU speed, other interrupts off the PPS CPU, GPS stationary mode |
+| `systemd/timeserver-tune.service` | `/etc/systemd/system/` | Runs `timeserver-tune` at boot |
 | `install.sh` | – | Installs on the Pi (run as root) |
 | `deploy.sh` | – | Uploads to the Pi over SSH and runs `install.sh` |
 | `tools/fit_tempcomp.py` | – | Fits chrony `tempcomp` coefficients from the Pi's temperature and frequency logs |

@@ -81,6 +81,13 @@ if [[ $WITH_CONFIGS -eq 1 ]]; then
       /etc/sysctl.d/90-timeserver-failover.conf; then
     /usr/sbin/sysctl -q -p /etc/sysctl.d/90-timeserver-failover.conf
   fi
+  # Boot-time tuning: always (re)run it so a changed script takes effect now.
+  install_config usr/local/sbin/timeserver-tune /usr/local/sbin/timeserver-tune 0755 || true
+  install_config systemd/timeserver-tune.service \
+    /etc/systemd/system/timeserver-tune.service || true
+  systemctl daemon-reload
+  systemctl enable timeserver-tune.service >/dev/null 2>&1
+  RUN_TUNE=1
   if install_config boot/firmware/config.txt /boot/firmware/config.txt; then
     echo "    NOTE: config.txt changed - reboot the Pi for it to take effect"
   fi
@@ -91,6 +98,12 @@ if [[ $WITH_CONFIGS -eq 1 ]]; then
   if [[ ${RESTART_CHRONY:-0} -eq 1 ]]; then
     log "Restarting chrony"
     systemctl restart chrony
+  fi
+  if [[ ${RUN_TUNE:-0} -eq 1 ]]; then
+    log "Applying low-jitter tuning"
+    # After gpsd's restart above, so the GPS mode is sent to the running gpsd.
+    systemctl restart timeserver-tune.service || echo "    WARNING: tuning did not fully apply (journalctl -u timeserver-tune)"
+    journalctl -u timeserver-tune.service -n 4 --no-pager -o cat | sed 's/^/    /'
   fi
 fi
 

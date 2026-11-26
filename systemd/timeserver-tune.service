@@ -1,0 +1,12 @@
+[Unit]
+Description=Low-jitter tuning for the time server (CPU speed, interrupts, GPS mode)
+After=gpsd.service gpsd.socket
+Wants=gpsd.socket
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/timeserver-tune
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
