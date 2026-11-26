@@ -299,24 +299,31 @@ def _tail_lines(path, max_bytes=64 * 1024):
 
 
 def parse_pps_history(refid="PPS", path=REFCLOCKS_LOG, limit=60):
-    """Return the most recent cooked offsets (seconds) for one refclock.
+    """Return the most recent filtered offsets (seconds) for one refclock.
 
     refclocks.log columns (chrony "log refclocks"):
       date time refid DP L P raw-offset cooked-offset dispersion
+
+    chrony writes two kinds of lines. Per-pulse lines have a driver poll
+    number in DP; for a PPS refclock locked to NMEA their offsets are only
+    the pulse phase (e.g. 6.97e-02), not the clock error. Filtered samples,
+    one per poll, have "-" in DP/P/raw and carry the real offset. Use those,
+    and fall back to per-pulse cooked offsets only if none are present.
     """
     try:
         lines = _tail_lines(path)
     except OSError:
         return []
-    samples = []
+    filtered, per_pulse = [], []
     for line in lines:
         parts = line.split()
         if len(parts) < 9 or parts[2] != refid:
             continue
         cooked = safe_float(parts[7])
-        if cooked is not None:
-            samples.append(cooked)
-    return samples[-limit:]
+        if cooked is None:
+            continue
+        (filtered if parts[3] == "-" else per_pulse).append(cooked)
+    return (filtered or per_pulse)[-limit:]
 
 
 def _read_gpsd(host="127.0.0.1", port=2947, timeout=3.0):

@@ -37,14 +37,24 @@ CLIENTS_CSV = """\
 2001:db8::1,42,0,10,-,3600,0,0,-,4294967295
 """
 
+# Format recorded from the Pi (chrony 4.3, PPS refclock with "lock NMEA").
+# Per-pulse lines carry pulse phase; "-" lines are filtered offsets.
 REFCLOCKS_LOG = """\
 ===============================================================================
    Date (UTC) Time         Refid  DP L P  Raw offset   Cooked offset      Disp.
 ===============================================================================
-2026-11-25 10:00:00.000000 NMEA    0 N 0  8.12345e-02   8.12345e-02  1.000e-03
-2026-11-25 10:00:00.000000 PPS     0 N 0  1.23456e-07  -4.20000e-08  1.000e-09
-2026-11-25 10:00:01.000000 PPS     0 N 0  1.33456e-07   3.10000e-08  1.000e-09
-2026-11-25 10:00:02.000000 PPS     0 N 0  1.13456e-07  -1.00000e-09  1.000e-09
+2026-10-24 20:08:24.930279 PPS    12 N 1  6.972097e-02  6.972099e-02  3.700e-08
+2026-10-24 20:08:26.333333 NMEA    - N -       -       8.12345e-02  1.000e-03
+2026-10-24 20:08:26.333333 PPS     - N -       -       -4.200000e-08  2.105e-07
+2026-10-24 20:08:30.930279 PPS    13 N 1  2.618798e-02  2.618803e-02  3.700e-08
+2026-10-24 20:08:42.333333 PPS     - N -       -       3.100000e-08  2.105e-07
+2026-10-24 20:08:58.333333 PPS     - N -       -       -1.000000e-09  2.105e-07
+2026-10-24 20:08:59.973811 PPS     0 N 1  2.618798e-02  2.618803e-02  3.700e-08
+"""
+
+PER_PULSE_ONLY_LOG = """\
+2026-11-25 10:00:00.000000 PPS     0 N 1  1.23456e-07  -4.20000e-08  1.000e-09
+2026-11-25 10:00:01.000000 PPS     1 N 1  1.33456e-07   3.10000e-08  1.000e-09
 """
 
 
@@ -137,12 +147,17 @@ class PpsHistoryTests(unittest.TestCase):
     def tearDown(self):
         os.unlink(self.path)
 
-    def test_reads_cooked_offsets_for_refid_only(self):
+    def test_uses_filtered_offsets_not_pulse_phase(self):
         self.assertEqual(cd.parse_pps_history("PPS", self.path),
                          [-4.2e-08, 3.1e-08, -1e-09])
 
     def test_other_refid(self):
         self.assertEqual(cd.parse_pps_history("NMEA", self.path), [0.0812345])
+
+    def test_falls_back_to_per_pulse_cooked(self):
+        with open(self.path, "w") as f:
+            f.write(PER_PULSE_ONLY_LOG)
+        self.assertEqual(cd.parse_pps_history("PPS", self.path), [-4.2e-08, 3.1e-08])
 
     def test_missing_file(self):
         self.assertEqual(cd.parse_pps_history("PPS", self.path + ".nope"), [])
