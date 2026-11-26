@@ -1,0 +1,12 @@
+[Unit]
+Description=Chrony GPS Dashboard
+After=network.target chrony.service
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/chrony-dashboard/chrony_dashboard.py --port 8080
+Restart=always
+User=root
+WorkingDirectory=/opt/chrony-dashboard
+
+[Install]
+WantedBy=multi-user.target
