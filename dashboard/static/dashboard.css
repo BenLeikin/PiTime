@@ -815,10 +815,32 @@ footer {
 }
 .range-buttons button:hover { color: var(--cyan); border-color: var(--cyan-dim); }
 .range-buttons button.active { color: var(--cyan); border-color: var(--cyan); background: rgba(0,212,255,0.08); }
-.history-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem 1.5rem; margin-top: 0.9rem; }
+.history-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 1rem 1.5rem; margin-top: 0.9rem; }
 .history-title { font-size: 0.62rem; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); margin-bottom: 0.3rem; }
 .history-chart { width: 100%; height: 120px; display: block; }
 .history-band { width: 100%; height: 22px; display: block; }
 .history-legend { font-size: 0.62rem; color: var(--muted); margin-top: 0.3rem; display: flex; gap: 1rem; flex-wrap: wrap; }
 .history-legend .swatch { display: inline-block; width: 8px; height: 8px; margin-right: 0.35rem; vertical-align: middle; }
 .history-axis { display: flex; justify-content: space-between; font-size: 0.58rem; color: var(--muted); margin-top: 0.7rem; letter-spacing: 0.08em; }
+
+/* GPS lost: amber, between DEGRADED yellow and FAULT red. */
+.banner.holdover { color: var(--amber); }
+.banner.holdover::before { background: var(--amber); box-shadow: 0 0 16px var(--amber); }
+.banner[hidden] { display: none; }
+.history-summary { font-size: 0.7rem; color: var(--text, #c0d0e0); margin-top: 0.6rem; letter-spacing: 0.05em; }
+.history-summary .good { color: var(--green); }
+.history-summary .warn { color: var(--yellow); }
+.history-summary .bad { color: var(--red); }
+
+/* Phones: stack what sits side by side on wider screens. */
+@media (max-width: 600px) {
+  .banner {
+    flex-direction: column; align-items: flex-start; gap: 0.45rem;
+    padding: 0.8rem 1rem 0.8rem 1.4rem; font-size: 0.8rem; letter-spacing: 0.15em;
+  }
+  .banner .issues { text-align: left; letter-spacing: 0.04em; }
+  .fun-fact { flex-direction: column; align-items: flex-start; gap: 0.35rem; padding: 0.6rem 0.9rem; }
+  .skyview-header { flex-direction: column; align-items: flex-start; gap: 0.35rem; padding: 0.6rem 0.9rem 0.5rem; }
+  .skyview-header .legend { flex-wrap: wrap; }
+  .history-summary { line-height: 1.6; }
+}

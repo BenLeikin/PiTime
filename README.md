@@ -150,6 +150,7 @@ Everything specific to one site (who may use the server, the NTS host name, the 
 | `scripts/health_monitor.py`, `scripts/timeserver-monitor.conf.example` | another machine | Alerts through a webhook when the server is unhealthy or unreachable |
 | `scripts/convert-to-chrony.sh` | – | Points another Linux host at this server |
 | `scripts/sync-nts-cert.sh.example` | – | Pushes a renewed TLS certificate to the Pi for NTS |
+| `tools/release_notes.py` | – | Prints a version's notes from CHANGELOG.md, for GitHub or GitLab releases |
 | `tools/fit_tempcomp.py` | – | Fits chrony `tempcomp` coefficients from the Pi's temperature and frequency logs |
 | `tools/check.sh`, `ruff.toml`, `.gitlab-ci.yml` | – | Tests and linters, locally and in CI |
 | `tests/` | – | Python and JavaScript tests using recorded chronyc/gpsd output and synthetic logs |
@@ -257,10 +258,30 @@ while the Pi is on Wi-Fi. The Pi's own clock stays PPS-disciplined either way.
 ## History
 
 The dashboard records one sample a minute (offsets, frequency, temperature,
-satellites, signal, health), keeps 30 days, and draws them in the History
-section for the last 6 hours to 30 days. Samples are written to disk every
-10 minutes to spare the SD card. `GET /api/history?range=6h|24h|7d|30d`
-returns the same data as JSON.
+satellites, signal, client traffic, health), keeps 30 days, and draws them in
+the History section for the last 6 hours to 30 days. Samples are written to
+disk every 10 minutes to spare the SD card.
+
+- **On GPS** is the share of the period the server was at stratum 1, with the
+  number of outages and the longest. Stretches with nothing recorded (the
+  dashboard or the Pi was down) count as unknown, not as outages.
+- **Client traffic** is NTP requests per hour, NTS-authenticated ones, and
+  ones dropped by the rate limits.
+- **Crystal ageing** takes the last 30 days on GPS, removes the frequency's
+  dependence on temperature, and shows what is left day by day with its trend
+  in ppm per month: how fast the crystal is drifting as it ages.
+
+`GET /api/history?range=6h|24h|7d|30d` returns the same data as JSON.
+
+## On the page
+
+- The header shows the active network link: cable, or Wi-Fi and its signal.
+  Over a cable clients get time good to tens of microseconds; over Wi-Fi, to
+  milliseconds.
+- When the clock is not on GPS, a banner says since when, what it uses
+  instead, and chrony's bound on its error.
+- The NTS certificate's and the leap-second table's expiry dates are listed;
+  the status turns DEGRADED 21 and 30 days before them.
 
 ## Keeping the Pi healthy
 
@@ -315,7 +336,9 @@ first run.
 
 ## Versions
 
-[CHANGELOG.md](CHANGELOG.md) lists what changed in each version. 1.0.0 is the
+[CHANGELOG.md](CHANGELOG.md) lists what changed in each version.
+`tools/release_notes.py 2.2.0` prints one version's notes, ready to paste into
+a release on GitHub or GitLab. 1.0.0 is the
 project as first published; 2.0.0 is the merged and reworked one. Upgrading
 an existing 1.0.0 install means following INSTALL.md again.
 

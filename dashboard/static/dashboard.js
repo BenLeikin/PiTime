@@ -498,6 +498,7 @@ function render(d) {
 
   setText('h-hostname', s.hostname);
   setText('h-ip', s.ip);
+  setText('h-link', linkText(s.link));
   setText('h-uptime', s.uptime);
   setText('h-temp', s.temperature);
   setText('h-ts', s.timestamp);
@@ -571,7 +572,10 @@ function render(d) {
   setText('s-load', s.loadavg);
   setText('s-uptime', s.uptime);
   setText('s-isolated', s.isolated_cpus);
-  setText('s-leap', d.next_leap || 'no scheduled leap');
+  const ex = d.expiries || {};
+  setExpiry('s-leap', ex.leap_table, d.next_leap || 'unknown', 30);
+  setExpiry('s-cert', ex.nts_cert, 'no NTS certificate', 21);
+  renderHoldover(d.sync, d.system.epoch);
 
   const ccDiv = document.getElementById('cpu-cores');
   const isolatedSet = new Set();
@@ -672,6 +676,43 @@ function render(d) {
   }
 }
 
+
+// "cable" or "Wi-Fi -38 dBm": what carries this server's traffic, which decides
+// whether clients get microseconds or milliseconds.
+function linkText(link) {
+  if (!link || link.kind === 'none') return '\u2014';
+  return link.signal_dbm != null ? `${link.kind} ${Math.round(link.signal_dbm)} dBm` : link.kind;
+}
+
+// Show an expiry date with the days left, coloured once it is close.
+function setExpiry(id, item, fallback, warnDays) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (!item) { el.textContent = fallback; el.className = 'stat-val'; return; }
+  const days = item.days;
+  el.textContent = days < 0 ? `${item.expires} (expired)` : `${item.expires} (${days} d)`;
+  el.className = 'stat-val ' + (days < 0 ? 'bad' : days < warnDays ? 'warn' : '');
+}
+
+// While the clock is not disciplined by GPS, say since when, what it uses
+// instead, and how far off chrony says it could be.
+function renderHoldover(sync, serverNow) {
+  const banner = document.getElementById('holdover-banner');
+  if (!sync || sync.on_gps !== false) { banner.hidden = true; return; }
+  banner.hidden = false;
+  const ref = sync.reference || '';
+  const freeRunning = !ref || ref.includes('()');
+  // The snapshot's clock reading is taken a moment before the sync state, so
+  // clamp at zero rather than show a negative duration.
+  const lost = sync.last_on_gps != null ? Math.max(0, serverNow - sync.last_on_gps) : null;
+  setText('holdover-text', freeRunning ? '\u25C6 GPS LOST \u25B8 FREE-RUNNING' : '\u25C6 GPS LOST \u25B8 ON INTERNET TIME');
+  const parts = [];
+  if (lost != null) parts.push(`last on GPS ${formatDuration(lost)} ago`);
+  else if (sync.since != null) parts.push(`${sync.since_exact ? '' : 'over '}${formatDuration(Math.max(0, serverNow - sync.since))} without GPS`);
+  if (!freeRunning) parts.push(`now using ${ref}`);
+  if (sync.error_bound_s != null) parts.push(`error bound \u00b1${formatSecondsAsHuman(sync.error_bound_s).replace(/^-/, '')}`);
+  setText('holdover-detail', parts.join('  \u25B8  '));
+}
 
 function generateFunFact(d) {
   const offsetStr = esc(d.tracking.last_offset || '');
@@ -892,8 +933,9 @@ function lastValue(values) {
 }
 
 // Draw a chart of up to a few series. Each series: {values, color, label,
-// format, axis, robust}. Series on the same axis ('left' or 'right') share a
-// scale; `robust` scales that axis to the 2nd-98th percentile.
+// format, axis, robust, minSpan}. Series on the same axis ('left' or 'right')
+// share a scale; `robust` scales that axis to the 2nd-98th percentile, and
+// `minSpan` is the least range of values the axis covers.
 function drawHistoryChart(id, series) {
   const svg = document.getElementById(id);
   while (svg.firstChild) svg.removeChild(svg.firstChild);
@@ -914,6 +956,14 @@ function drawHistoryChart(id, series) {
     const group = series.filter(s => (s.axis || 'left') === axis);
     const range = seriesRange(group.map(s => s.values), group.some(s => s.robust));
     if (!range) continue;
+    // A minimum height, so that noise far below what matters is not
+    // stretched to fill the chart.
+    const minSpan = Math.max(0, ...group.map(s => s.minSpan || 0));
+    if (range[1] - range[0] < minSpan) {
+      const mid = (range[0] + range[1]) / 2;
+      range[0] = mid - minSpan / 2;
+      range[1] = mid + minSpan / 2;
+    }
     for (const s of group) {
       svg.appendChild(svgEl('path', { d: linePath(s.values, w, h, range[0], range[1], pad),
         fill: 'none', stroke: s.color, 'stroke-width': 1.4, 'vector-effect': 'non-scaling-stroke' }));
@@ -962,6 +1012,44 @@ function drawHealthBand(id, values) {
     .map((name, i) => `${name} ${Math.round(100 * time[i] / recorded)}%`).join('  ◆  ');
 }
 
+function renderSummary(sum, range) {
+  const el = document.getElementById('hist-summary');
+  if (!sum || sum.on_gps_pct == null) { el.textContent = 'no history recorded yet'; return; }
+  const pct = sum.on_gps_pct;
+  const cls = pct >= 99.9 ? 'good' : pct >= 99 ? 'warn' : 'bad';
+  el.textContent = '';
+  const strong = document.createElement('span');
+  strong.className = cls;
+  strong.textContent = `On GPS ${pct.toFixed(pct >= 99.95 || pct < 10 ? 1 : 2)}%`;
+  el.appendChild(strong);
+  const rest = [];
+  rest.push(sum.outages === 0 ? 'no outages'
+    : `${sum.outages} outage${sum.outages === 1 ? '' : 's'}, longest ${formatDuration(sum.longest_outage_s)}`);
+  if (sum.ongoing_outage_since != null) rest.push('one is ongoing');
+  const recorded = sum.minutes_recorded * 60;
+  rest.push(`over ${formatDuration(recorded)} recorded in the last ${range}`);
+  el.appendChild(document.createTextNode('  \u25C6  ' + rest.join('  \u25C6  ')));
+}
+
+// Daily frequency at a fixed temperature: what is left moves only as the
+// crystal ages. Plotted as points per day with the trend in the legend.
+function renderAgeing(a) {
+  const daily = (a && a.daily) || [];
+  drawHistoryChart('hist-ageing', [
+    { values: daily.map(d => d[1]), color: '#ff00ff', label: `at ${a ? a.reference_c : 40} \u00b0C`,
+      format: v => v.toFixed(3) + ' ppm', minSpan: 0.05 },
+  ]);
+  const legend = document.getElementById('hist-ageing-legend');
+  const note = document.createElement('span');
+  if (!a || daily.length < 3) {
+    note.textContent = `needs 3 days on GPS (${daily.length} so far)`;
+  } else {
+    note.textContent = `trend ${a.trend_ppm_per_month >= 0 ? '+' : ''}${a.trend_ppm_per_month.toFixed(3)} ppm/month` +
+      `  \u25C6  temperature effect ${a.temp_coeff_ppm_per_c.toFixed(3)} ppm/\u00b0C`;
+  }
+  legend.appendChild(note);
+}
+
 function rangeLabel(seconds) {
   return seconds >= 86400 ? `${Math.round(seconds / 86400)} d ago` : `${Math.round(seconds / 3600)} h ago`;
 }
@@ -982,7 +1070,17 @@ function renderHistory(h) {
     { values: f.sats_used, color: '#00ff88', label: 'satellites used', format: v => v.toFixed(1) },
     { values: f.best_snr, color: '#00d4ff', label: 'best signal', format: v => v.toFixed(0) + ' dB-Hz', axis: 'right' },
   ]);
+  // Traffic: the history stores counts per minute; show them per hour.
+  const perHour = values => values.map(v => (v == null ? null : v * 60));
+  const count = v => Math.round(v).toLocaleString() + '/h';
+  drawHistoryChart('hist-traffic', [
+    { values: perHour(f.ntp_requests || []), color: '#00d4ff', label: 'requests', format: count },
+    { values: perHour(f.nts_requests || []), color: '#00ff88', label: 'NTS', format: count },
+    { values: perHour(f.ntp_dropped || []), color: '#ff3355', label: 'dropped', format: count },
+  ]);
+  renderAgeing(h.ageing);
   drawHealthBand('hist-health', f.health);
+  renderSummary(h.summary, h.range);
   setText('hist-start', rangeLabel(h.step * f.health.length));
   setText('hist-note', `${h.range} ◆ averages over ${formatDuration(h.step)} each`);
 }
@@ -1061,6 +1159,10 @@ const GLOSSARY = {
   'Frequency and temperature': 'How fast the uncorrected crystal runs (chrony cancels this) next to the CPU temperature. The frequency follows temperature; this is what temperature compensation removes.',
   'GPS reception': 'Satellites in the fix and the strongest signal among them. A falling signal warns of a lost fix before it happens.',
   'Health': 'The dashboard status over time: green OK, yellow DEGRADED, red FAULT.',
+  'Client traffic': 'NTP requests per hour, how many were NTS-authenticated, and how many were dropped by the rate limits or access rules.',
+  'Crystal ageing (last 30 days)': 'Each point is one day: the clock crystal\'s frequency error, corrected to a fixed temperature using the temperature effect measured from the same data. What is left changes slowly as the crystal ages; the trend is how fast.',
+  'Link': 'The network interface carrying this server\'s traffic. Over a cable clients get time good to tens of microseconds; over Wi-Fi, to milliseconds.',
+  'NTS Certificate': 'When the TLS certificate used for NTS (authenticated time) expires. It must be renewed before then; the status turns DEGRADED three weeks ahead.',
 
   // Tracking detail
   'Tracking Detail': 'Detailed metrics from "chronyc tracking" describing your synchronization state.',

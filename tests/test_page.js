@@ -216,3 +216,30 @@ test('history charts scale robustly and break lines at gaps', () => {
   assert.deepStrictEqual([...page.minMax([3, null, -1, 7])], [-1, 7]);
   assert.strictEqual(page.minMax([null]), null);
 });
+
+test('link, expiry and GPS-lost display', () => {
+  const { page, elements } = loadPage();
+  assert.strictEqual(page.linkText({ kind: 'Wi-Fi', signal_dbm: -38 }), 'Wi-Fi -38 dBm');
+  assert.strictEqual(page.linkText({ kind: 'cable', signal_dbm: null }), 'cable');
+  assert.strictEqual(page.linkText(null), '—');
+
+  page.setExpiry('exp', { expires: '2027-01-28', days: 63 }, 'none', 21);
+  assert.strictEqual(elements.exp.textContent, '2027-01-28 (63 d)');
+  assert.strictEqual(elements.exp.className, 'stat-val ');
+  page.setExpiry('exp', { expires: '2026-12-10', days: 14 }, 'none', 21);
+  assert.strictEqual(elements.exp.className, 'stat-val warn');
+  page.setExpiry('exp', { expires: '2026-11-01', days: -25 }, 'none', 21);
+  assert.strictEqual(elements.exp.textContent, '2026-11-01 (expired)');
+
+  page.renderHoldover({ on_gps: true }, 1000);
+  assert.strictEqual(elements['holdover-banner'].hidden, true);
+  page.renderHoldover({ on_gps: false, since: 900, since_exact: true, last_on_gps: 880,
+                        reference: 'A29FC87B (162.159.200.123)', error_bound_s: 0.013 }, 1000);
+  assert.strictEqual(elements['holdover-banner'].hidden, false);
+  assert.match(elements['holdover-text'].textContent, /ON INTERNET TIME/);
+  assert.match(elements['holdover-detail'].textContent, /last on GPS 2m 0s ago.*162\.159\.200\.123.*±13\.000 ms/);
+  page.renderHoldover({ on_gps: false, since: 900, since_exact: false, last_on_gps: null,
+                        reference: '7F7F0101 ()', error_bound_s: null }, 1000);
+  assert.match(elements['holdover-text'].textContent, /FREE-RUNNING/);
+  assert.match(elements['holdover-detail'].textContent, /^over 1m 40s without GPS$/);
+});

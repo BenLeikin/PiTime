@@ -2,6 +2,23 @@
 
 Notable changes to this project. Versions follow [semantic versioning](https://semver.org/): the major number changes when an upgrade needs action on an existing install.
 
+## [2.2.0] - 2026-11-26
+
+### Added
+
+- **On GPS percentage**: the History section says how much of the chosen period the server was disciplined by GPS, how many outages there were and the longest, from the recorded history.
+- **GPS-lost banner**: while the clock is not on GPS, the page says since when, what it uses instead, and chrony's bound on the error.
+- **Expiry warnings**: the health check turns DEGRADED three weeks before the NTS certificate expires and 30 days before the leap-second table does, so the monitor alerts in time. Both dates are on the page.
+- **Active network link** in the page header: cable, or Wi-Fi with its signal strength.
+- **Client traffic chart**: NTP requests per hour, how many were NTS-authenticated, and how many were dropped.
+- **Crystal ageing**: the crystal's daily frequency at a fixed temperature over the last 30 days, with its trend in ppm per month.
+- `tools/release_notes.py` prints a version's notes from this changelog for a GitHub or GitLab release.
+
+### Changed
+
+- The page is laid out for phones: banners, the sky view header and the "did you know" strip stack instead of squeezing side by side, and the history charts fit the screen.
+- The history file gains three columns for traffic; older files are upgraded when the dashboard starts.
+
 ## [2.1.0] - 2026-11-26
 
 ### Added

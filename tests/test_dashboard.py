@@ -3,6 +3,7 @@
 import contextlib
 import importlib.util
 import json
+import math
 import os
 import socket
 import tempfile
@@ -487,6 +488,166 @@ class HistoryTests(unittest.TestCase):
         snapshot["gps"] = {"available": False}
         row = cd.history_sample(snapshot)
         self.assertEqual((row["sats_used"], row["best_snr"], row["fix"]), (None, None, None))
+
+
+class TempDirTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir)
+
+    def write(self, name, text):
+        path = os.path.join(self.dir, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+
+class NetworkLinkTests(TempDirTest):
+    ROUTE = ("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n"
+             "wlan0\t00000000\t0100000A\t0003\t0\t0\t600\t00000000\n"
+             "end0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\n"
+             "end0\t0000000A\t00000000\t0001\t0\t0\t100\t00FCFFFF\n")
+    WIRELESS = ("Inter-| sta-|   Quality        |   Discarded packets\n"
+                " face | tus | link level noise |  nwid  crypt   frag\n"
+                " wlan0: 0000   70.  -38.  -256        0      0      0\n")
+
+    def link(self, route):
+        os.makedirs(os.path.join(self.dir, "net", "wlan0", "wireless"), exist_ok=True)
+        os.makedirs(os.path.join(self.dir, "net", "end0"), exist_ok=True)
+        return cd.get_network_link(self.write("route", route), self.write("wireless", self.WIRELESS),
+                                   os.path.join(self.dir, "net"))
+
+    def test_cable_preferred_by_metric(self):
+        self.assertEqual(self.link(self.ROUTE), {"iface": "end0", "kind": "cable", "signal_dbm": None})
+
+    def test_wifi_with_signal(self):
+        wifi_only = "\n".join(line for line in self.ROUTE.splitlines() if not line.startswith("end0"))
+        self.assertEqual(self.link(wifi_only + "\n"),
+                         {"iface": "wlan0", "kind": "Wi-Fi", "signal_dbm": -38.0})
+
+    def test_no_default_route(self):
+        self.assertEqual(self.link(self.ROUTE.splitlines()[0] + "\n")["kind"], "none")
+
+
+class ExpiryTests(TempDirTest):
+    def test_cert_path_from_chrony_config_and_conf_d(self):
+        main = self.write("chrony.conf", "server x\nconfdir /etc/chrony/conf.d\n")
+        self.write("conf.d/site.conf", "ntsserverkey /k.key\nntsservercert /etc/chrony/nts/full.crt\n")
+        self.write("conf.d/ignored.txt", "ntsservercert /wrong\n")
+        self.assertEqual(cd.nts_cert_path((main, os.path.join(self.dir, "conf.d"))),
+                         "/etc/chrony/nts/full.crt")
+        self.assertIsNone(cd.nts_cert_path((self.write("other.conf", "server x\n"),)))
+
+    def test_cert_expiry_parses_openssl(self):
+        with mock.patch.object(cd, "run", return_value="notAfter=Jan 28 23:59:59 2027 GMT"):
+            when = cd.cert_expiry("/x.crt")
+        self.assertEqual(cd.datetime.fromtimestamp(when, tz=cd.UTC).strftime("%Y-%m-%d %H:%M"),
+                         "2027-01-28 23:59")
+        cd._warned.pop("nts-cert", None)
+        with mock.patch.object(cd, "run", return_value=""), \
+             self.assertLogs("chrony-dashboard", level="WARNING"):
+            self.assertIsNone(cd.cert_expiry("/missing.crt"))
+
+    def test_health_warns_before_expiry(self):
+        tracking = {"stratum": "1", "reference_id": "50505300 (PPS)"}
+        sources = [{"name": "PPS", "state": "synced", "reach": "377"}]
+        gps = {"available": True, "fix_mode": "3D", "sats_used": 6}
+        far = {"nts_cert": {"expires": "2027-01-28", "days": 63},
+               "leap_table": {"expires": "2027-06-28", "days": 213}}
+        self.assertEqual(cd.compute_health(tracking, sources, gps, far)["status"], "OK")
+        near = {"nts_cert": {"expires": "2026-12-10", "days": 14}, "leap_table": None}
+        self.assertEqual(cd.compute_health(tracking, sources, gps, near),
+                         {"status": "DEGRADED", "issues": ["NTS certificate expires in 14 days"]})
+        gone = {"nts_cert": None, "leap_table": {"expires": "2026-11-01", "days": -25}}
+        self.assertEqual(cd.compute_health(tracking, sources, gps, gone)["issues"],
+                         ["Leap-second table expired 25 days ago"])
+
+
+class SyncTrackerTests(unittest.TestCase):
+    ON = {"reference_id": "50505300 (PPS)", "root_delay_s": 1e-9, "root_dispersion_s": 8e-6}
+    OFF = {"reference_id": "A29FC87B (162.159.200.123)", "root_delay_s": 0.02,
+           "root_dispersion_s": 0.003}
+
+    def test_tracks_last_time_on_gps(self):
+        sync = cd.SyncTracker()
+        first = sync.note(self.ON, "PPS", now=1000)
+        self.assertEqual((first["on_gps"], first["since_exact"]), (True, False))
+        sync.note(self.ON, "PPS", now=1060)
+        lost = sync.note(self.OFF, "PPS", now=1120)
+        self.assertEqual((lost["on_gps"], lost["since"], lost["since_exact"], lost["last_on_gps"]),
+                         (False, 1120, True, 1060))
+        self.assertAlmostEqual(lost["error_bound_s"], 0.013)   # 3 ms + 20 ms / 2
+        self.assertEqual(sync.note(self.ON, "PPS", now=1200)["since"], 1200)
+
+    def test_other_refclock_names_are_not_gps(self):
+        self.assertFalse(cd.SyncTracker().note({"reference_id": "50505300 (PPSX)"}, "PPS")["on_gps"])
+
+
+class TrafficTests(unittest.TestCase):
+    def test_deltas_and_restart(self):
+        counters = cd.CounterDeltas()
+        self.assertIsNone(counters.delta("ntp", "100"))      # first reading
+        self.assertEqual(counters.delta("ntp", "130"), 30)
+        self.assertEqual(counters.delta("ntp", "5"), 5)       # chronyd restarted
+        self.assertIsNone(counters.delta("ntp", "n/a"))
+
+
+class HistorySummaryTests(TempDirTest):
+    NOW = int(time.time()) // 60 * 60
+
+    def store(self, strata, start=None, temps=None, freqs=None):
+        store = cd.HistoryStore(path=os.path.join(self.dir, "h.sqlite3"), flush_s=3600)
+        start = start if start is not None else self.NOW - 60 * len(strata)
+        for i, st in enumerate(strata):
+            row = dict.fromkeys(name for name, _ in cd.HISTORY_FIELDS)
+            row["stratum"] = st
+            if temps:
+                row["temperature_c"], row["frequency_ppm"] = temps[i], freqs[i]
+            store.add(row, ts=start + 60 * i)
+        return store
+
+    def test_on_gps_share_and_outages(self):
+        strata = [1] * 50 + [3] * 10 + [1] * 30 + [None] * 5 + [2] * 5
+        summary = self.store(strata).summary(3600 * 2, now=self.NOW)
+        self.assertEqual(summary["minutes_recorded"], 95)
+        self.assertEqual(summary["on_gps_pct"], round(100 * 80 / 95, 2))
+        self.assertEqual(summary["outages"], 2)
+        self.assertEqual(summary["longest_outage_s"], 600)
+        self.assertIsNotNone(summary["ongoing_outage_since"])
+
+    def test_a_gap_in_recording_is_not_an_outage(self):
+        store = self.store([1] * 10)
+        row = dict.fromkeys(name for name, _ in cd.HISTORY_FIELDS)
+        row["stratum"] = 1
+        store.add(row, ts=self.NOW + 3600)          # an hour later, still on GPS
+        summary = store.summary(7200, now=self.NOW + 3600)
+        self.assertEqual((summary["outages"], summary["on_gps_pct"]), (0, 100.0))
+
+    def test_no_data(self):
+        summary = self.store([]).summary(3600, now=self.NOW)
+        self.assertIsNone(summary["on_gps_pct"])
+
+    def test_ageing_removes_temperature_and_finds_the_trend(self):
+        # Four days at -0.2 ppm/C, and the crystal ageing +0.03 ppm per day.
+        temps, freqs, strata = [], [], []
+        for minute in range(4 * 1440):
+            t = 40 + 3 * math.sin(2 * math.pi * minute / 1440)
+            temps.append(t)
+            freqs.append(9.0 - 0.2 * (t - 40) + 0.03 * minute / 1440)
+            strata.append(1)
+        start = (self.NOW // 86400 - 4) * 86400
+        ageing = self.store(strata, start=start, temps=temps, freqs=freqs).ageing(
+            days=30, now=start + 4 * 86400)
+        self.assertAlmostEqual(ageing["temp_coeff_ppm_per_c"], -0.2, places=2)
+        self.assertEqual(len(ageing["daily"]), 4)
+        self.assertAlmostEqual(ageing["trend_ppm_per_month"], 0.9, places=1)
+
+    def test_ageing_needs_data(self):
+        self.assertIsNone(self.store([1] * 30).ageing(now=self.NOW)["temp_coeff_ppm_per_c"])
 
 
 class VersionTests(unittest.TestCase):

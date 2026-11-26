@@ -37,6 +37,7 @@
     </div>
     <dl class="header-meta">
       <dt>Node</dt><dd id="h-ip">—</dd>
+      <dt>Link</dt><dd id="h-link">—</dd>
       <dt>Uptime</dt><dd id="h-uptime">—</dd>
       <dt>Core Temp</dt><dd id="h-temp">—</dd>
       <dt>Mission Time</dt><dd id="h-ts" style="font-size: 0.65rem">—</dd>
@@ -53,6 +54,11 @@
     <div class="banner ok" id="status-banner">
       <span id="status-text">CHECKING...</span>
       <span class="issues" id="status-issues"></span>
+    </div>
+
+    <div class="banner holdover" id="holdover-banner" hidden>
+      <span id="holdover-text"></span>
+      <span class="issues" id="holdover-detail"></span>
     </div>
 
     <div class="fun-fact" id="fun-fact">
@@ -137,6 +143,7 @@
           <button type="button" data-range="30d">30 d</button>
         </div>
       </div>
+      <div class="history-summary" id="hist-summary">&mdash;</div>
       <div class="history-grid">
         <div class="history-panel">
           <div class="history-title">Clock offset</div>
@@ -152,6 +159,16 @@
           <div class="history-title">GPS reception</div>
           <svg class="history-chart" id="hist-gps" preserveAspectRatio="none"></svg>
           <div class="history-legend" id="hist-gps-legend"></div>
+        </div>
+        <div class="history-panel">
+          <div class="history-title">Client traffic</div>
+          <svg class="history-chart" id="hist-traffic" preserveAspectRatio="none"></svg>
+          <div class="history-legend" id="hist-traffic-legend"></div>
+        </div>
+        <div class="history-panel">
+          <div class="history-title">Crystal ageing (last 30 days)</div>
+          <svg class="history-chart" id="hist-ageing" preserveAspectRatio="none"></svg>
+          <div class="history-legend" id="hist-ageing-legend"></div>
         </div>
         <div class="history-panel">
           <div class="history-title">Health</div>
@@ -186,6 +203,7 @@
         <div class="stat-row"><span class="stat-key">System Uptime</span><span class="stat-val" id="s-uptime">—</span></div>
         <div class="stat-row"><span class="stat-key">Isolated Cores</span><span class="stat-val amber" id="s-isolated">—</span></div>
         <div class="stat-row"><span class="stat-key">Leap Data Expiry</span><span class="stat-val" id="s-leap">—</span></div>
+        <div class="stat-row"><span class="stat-key">NTS Certificate</span><span class="stat-val" id="s-cert">—</span></div>
       </div>
     </div>
 

@@ -36,7 +36,7 @@ from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, UTC
 
 # Keep in step with the newest entry in CHANGELOG.md (a test checks it).
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 log = logging.getLogger("chrony-dashboard")
 log.addHandler(logging.NullHandler())  # main() sets up real logging
@@ -897,6 +897,70 @@ def get_isolated_cpus():
         return "—"  # not every kernel exposes this
 
 
+CHRONY_CONFIGS = ("/etc/chrony/chrony.conf", "/etc/chrony/conf.d")
+EXPIRY_WARN_DAYS = {"nts_cert": 21, "leap_table": 30}
+_expiry_cache = {"at": float("-inf"), "value": None}
+
+
+def _days_until(epoch, now=None):
+    return int((epoch - (time.time() if now is None else now)) // 86400)
+
+
+def nts_cert_path(configs=CHRONY_CONFIGS):
+    """The certificate chrony serves NTS with (ntsservercert), or None."""
+    files = []
+    for path in configs:
+        if os.path.isdir(path):
+            files += sorted(os.path.join(path, n) for n in os.listdir(path)
+                            if n.endswith(".conf"))
+        else:
+            files.append(path)
+    cert = None
+    for path in files:
+        try:
+            with open(path) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0] == "ntsservercert":
+                        cert = parts[1]
+        except OSError:
+            continue
+    return cert
+
+
+def cert_expiry(path):
+    """When a PEM certificate expires (epoch seconds), or None if unreadable."""
+    out = run(["openssl", "x509", "-noout", "-enddate", "-in", path])
+    if not out.startswith("notAfter="):
+        warn("nts-cert", f"cannot read the NTS certificate {path}")
+        return None
+    try:
+        when = datetime.strptime(out.split("=", 1)[1].strip(), "%b %d %H:%M:%S %Y %Z")
+    except ValueError:
+        return None
+    return when.replace(tzinfo=UTC).timestamp()
+
+
+def get_expiries(max_age_s=3600):
+    """Expiry dates that need renewing in time: the NTS certificate and the
+    leap-second table. Each is {"expires": "YYYY-MM-DD", "days": n} or None.
+    Read at most once an hour."""
+    if time.monotonic() - _expiry_cache["at"] < max_age_s:
+        return _expiry_cache["value"]
+    result = {"nts_cert": None, "leap_table": None}
+    cert = nts_cert_path()
+    when = cert_expiry(cert) if cert else None
+    if when is not None:
+        result["nts_cert"] = {"expires": datetime.fromtimestamp(when, tz=UTC).strftime("%Y-%m-%d"),
+                              "days": _days_until(when)}
+    leap = get_leap_table_expiry()
+    if leap:
+        when = datetime.strptime(leap, "%Y-%m-%d").replace(tzinfo=UTC).timestamp()
+        result["leap_table"] = {"expires": leap, "days": _days_until(when)}
+    _expiry_cache.update(at=time.monotonic(), value=result)
+    return result
+
+
 def get_leap_table_expiry():
     """The date the system's leap-second table expires (YYYY-MM-DD), or None."""
     leap_file = "/usr/share/zoneinfo/leap-seconds.list"
@@ -929,6 +993,42 @@ def get_uptime():
     parts = [f"{n} {unit}{'' if n == 1 else 's'}"
              for n, unit in ((days, "day"), (hours, "hour"), (mins, "minute")) if n]
     return "up " + (", ".join(parts) or "0 minutes")
+
+
+def get_network_link(route="/proc/net/route", wireless="/proc/net/wireless",
+                     sys_net="/sys/class/net"):
+    """The interface carrying the default route: {"iface", "kind", "signal_dbm"}.
+
+    kind is "cable" or "Wi-Fi"; signal_dbm is the Wi-Fi signal, or None. It
+    decides what clients get: tens of microseconds over a cable, milliseconds
+    over Wi-Fi.
+    """
+    best = None
+    try:
+        with open(route) as f:
+            next(f)
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 7 and parts[1] == "00000000":   # default route
+                    metric = safe_int(parts[6], 0)
+                    if best is None or metric < best[1]:
+                        best = (parts[0], metric)
+    except (OSError, StopIteration) as e:
+        warn("route", f"cannot read /proc/net/route: {e}")
+    if best is None:
+        return {"iface": None, "kind": "none", "signal_dbm": None}
+    iface = best[0]
+    wifi = os.path.isdir(os.path.join(sys_net, iface, "wireless"))
+    signal = None
+    if wifi:
+        try:
+            with open(wireless) as f:
+                for line in f:
+                    if line.strip().startswith(iface + ":"):
+                        signal = safe_float(line.split()[3].rstrip("."))
+        except (OSError, IndexError):
+            pass
+    return {"iface": iface, "kind": "Wi-Fi" if wifi else "cable", "signal_dbm": signal}
 
 
 def get_system_info():
@@ -982,15 +1082,17 @@ def get_system_info():
         "timestamp": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "epoch": time.time(),
         "isolated_cpus": get_isolated_cpus(),
+        "link": get_network_link(),
     }
 
 
-def compute_health(tracking, sources, gps):
+def compute_health(tracking, sources, gps, expiries=None):
     """Overall status and the reasons for it.
 
     OK: disciplined by GPS as designed. DEGRADED: still serving time, but
-    something is off (no GPS fix, internet time only, a silent source).
-    FAULT: chrony has no synchronised source at all.
+    something is off (no GPS fix, internet time only, a silent source, a
+    certificate or leap-second table close to expiring). FAULT: chrony has no
+    synchronised source at all.
     """
     issues = []
     status = "OK"
@@ -1030,12 +1132,62 @@ def compute_health(tracking, sources, gps):
             issues.append(f"{source.get('name')} is selected but has stopped responding")
             if status == "OK":
                 status = "DEGRADED"
+    names = {"nts_cert": "NTS certificate", "leap_table": "Leap-second table"}
+    for key, item in (expiries or {}).items():
+        if item is None or item["days"] >= EXPIRY_WARN_DAYS.get(key, 30):
+            continue
+        days = item["days"]
+        issues.append(f"{names.get(key, key)} expired {-days} days ago" if days < 0
+                      else f"{names.get(key, key)} expires in {days} days")
+        if status == "OK":
+            status = "DEGRADED"
     return {"status": status, "issues": issues}
 
 
 # The collectors mostly wait on chronyc, gpsd or files, so running them side
 # by side makes a snapshot take as long as the slowest one, not the sum.
 _COLLECT_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="collect")
+
+
+class SyncTracker:
+    """When the server was last disciplined by GPS, for the GPS-lost banner.
+
+    Updated on every snapshot (at least once a minute, by the history
+    recorder).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.on_gps = None       # None until the first snapshot
+        self.since = None        # when the current state was first seen
+        self.since_exact = False
+        self.last_on_gps = None
+
+    def note(self, tracking, refid, now=None):
+        """Record one snapshot's reference; returns the state for the page."""
+        now = time.time() if now is None else now
+        on_gps = tracking.get("reference_id", "").endswith(f"({refid})")
+        delay, dispersion = tracking.get("root_delay_s"), tracking.get("root_dispersion_s")
+        with self._lock:
+            if on_gps != self.on_gps:
+                self.since_exact = self.on_gps is not None
+                self.on_gps, self.since = on_gps, now
+            if on_gps:
+                self.last_on_gps = now
+            return {
+                "on_gps": on_gps,
+                "since": self.since,
+                "since_exact": self.since_exact,
+                "last_on_gps": self.last_on_gps,
+                "reference": tracking.get("reference_id"),
+                # chrony's bound on the clock's error: everything accumulated
+                # from its reference, plus half the round trip to it.
+                "error_bound_s": (dispersion + delay / 2
+                                  if delay is not None and dispersion is not None else None),
+            }
+
+
+SYNC = SyncTracker()
 
 
 def get_all_data():
@@ -1053,10 +1205,13 @@ def get_all_data():
         "next_leap":   get_leap_table_expiry,
         "pps_history": lambda: PPS_SAMPLER.history(CONFIG["pps_refid"]),
         "system":      get_system_info,
+        "expiries":    get_expiries,
     }
     futures = {name: _COLLECT_POOL.submit(fn) for name, fn in jobs.items()}
     data = {name: future.result() for name, future in futures.items()}
-    data["health"] = compute_health(data["tracking"], data["sources"], data["gps"])
+    data["sync"] = SYNC.note(data["tracking"], CONFIG["pps_refid"])
+    data["health"] = compute_health(data["tracking"], data["sources"], data["gps"],
+                                    data["expiries"])
     return data
 
 
@@ -1110,7 +1265,32 @@ HISTORY_FIELDS = (
     ("best_snr", "strongest signal among satellites in use, dB-Hz"),
     ("fix", "GPS fix: 0 none, 2 2D, 3 3D"),
     ("health", "dashboard health: 0 OK, 1 DEGRADED, 2 FAULT"),
+    ("ntp_requests", "NTP requests answered in the minute"),
+    ("ntp_dropped", "NTP requests dropped (rate limit, access) in the minute"),
+    ("nts_requests", "NTS-authenticated requests in the minute"),
 )
+
+
+class CounterDeltas:
+    """Per-sample increases of chrony's cumulative counters.
+
+    The counters restart from zero when chronyd restarts; a counter lower
+    than last time is taken as counting from zero again.
+    """
+
+    def __init__(self):
+        self._last = {}
+
+    def delta(self, name, value):
+        """How much `name` grew since the previous call, or None the first time."""
+        value = safe_int(value)
+        previous, self._last[name] = self._last.get(name), value
+        if value is None or previous is None:
+            return None
+        return value - previous if value >= previous else value
+
+
+COUNTERS = CounterDeltas()
 HEALTH_CODES = {"OK": 0, "DEGRADED": 1, "FAULT": 2}
 FIX_CODES = {"2D": 2, "3D": 3}
 HISTORY_RANGES = {"6h": 6 * 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
@@ -1120,6 +1300,7 @@ HISTORY_POINTS = 360   # buckets per chart: enough detail, small responses
 def history_sample(data):
     """One history row (a dict of HISTORY_FIELDS) from a status snapshot."""
     tracking, gps = data.get("tracking", {}), data.get("gps", {})
+    stats = data.get("serverstats", {})
     pps = next((src for src in data.get("sources", [])
                 if src.get("name") == CONFIG["pps_refid"]), {})
     try:
@@ -1140,6 +1321,9 @@ def history_sample(data):
         "best_snr": (gps.get("best_snr") or None) if gps.get("available") else None,
         "fix": FIX_CODES.get(gps.get("fix_mode"), 0) if gps.get("available") else None,
         "health": HEALTH_CODES.get(data.get("health", {}).get("status")),
+        "ntp_requests": COUNTERS.delta("ntp", stats.get("ntp_packets_received")),
+        "ntp_dropped": COUNTERS.delta("dropped", stats.get("ntp_packets_dropped")),
+        "nts_requests": COUNTERS.delta("nts", stats.get("authenticated_ntp_packets")),
     }
 
 
@@ -1168,6 +1352,11 @@ class HistoryStore:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             columns = ", ".join(f"{name} REAL" for name, _ in HISTORY_FIELDS)
             conn.execute(f"CREATE TABLE IF NOT EXISTS samples (ts INTEGER PRIMARY KEY, {columns})")
+            # A file from an older version lacks the newer fields: add them.
+            have = {row[1] for row in conn.execute("PRAGMA table_info(samples)")}
+            for name, _ in HISTORY_FIELDS:
+                if name not in have:
+                    conn.execute(f"ALTER TABLE samples ADD COLUMN {name} REAL")
             self._ready = True
         return conn
 
@@ -1209,17 +1398,7 @@ class HistoryStore:
             del self._pending[:-1440]
             warn("history", f"cannot write {self.path}: {e}")
 
-    def query(self, seconds, points=HISTORY_POINTS, now=None):
-        """Averages over `points` equal buckets covering the last `seconds`.
-
-        Returns {"start", "step", "fields": {name: [value or None, ...]}}.
-        Health is the worst value in each bucket rather than the average, so a
-        short fault still shows.
-        """
-        now = int(now if now is not None else time.time())
-        start = now - seconds
-        step = seconds / points
-        names = [name for name, _ in HISTORY_FIELDS]
+    def _rows(self, start, names):
         rows = []
         try:
             conn = self._connect()
@@ -1234,6 +1413,89 @@ class HistoryStore:
         with self._lock:
             rows += [(ts, *(row.get(n) for n in names))
                      for ts, row in self._pending if ts >= start]
+        return rows
+
+    def summary(self, seconds, now=None):
+        """How much of the period the server was on GPS (stratum 1), and its outages.
+
+        Samples are a minute apart; a stretch with no samples (the dashboard
+        or the Pi was down) is unknown, so it neither counts as on GPS nor
+        joins two outages together.
+        """
+        now = int(now if now is not None else time.time())
+        rows = self._rows(now - seconds, ["stratum"])
+        known = [(ts, st) for ts, st in rows if st is not None]
+        on = sum(1 for _, st in known if st == 1)
+        outages, longest, run_start, last_ts = 0, 0, None, None
+        for ts, st in known:
+            if run_start is not None and (st == 1 or ts - last_ts > 150):
+                outages += 1
+                longest = max(longest, last_ts - run_start + 60)
+                run_start = None
+            if st != 1 and run_start is None:
+                run_start = ts
+            last_ts = ts
+        ongoing = None
+        if run_start is not None:
+            outages += 1
+            longest = max(longest, last_ts - run_start + 60)
+            ongoing = run_start
+        return {"on_gps_pct": round(100 * on / len(known), 2) if known else None,
+                "minutes_recorded": len(known), "outages": outages,
+                "longest_outage_s": longest, "ongoing_outage_since": ongoing}
+
+    def ageing(self, days=30, reference_c=40.0, now=None):
+        """The crystal's frequency at a fixed temperature, day by day.
+
+        Frequency follows temperature, so a straight line is fitted to
+        frequency against temperature over the whole period (only minutes on
+        GPS, when chrony's estimate is good) and each day's mean frequency is
+        shifted to `reference_c` with it. What remains changes only slowly as
+        the crystal ages; the trend is a straight line through the days.
+        """
+        now = int(now if now is not None else time.time())
+        rows = [(ts, f, t) for ts, st, f, t in
+                self._rows(now - days * 86400, ["stratum", "frequency_ppm", "temperature_c"])
+                if st == 1 and f is not None and t is not None]
+        result = {"reference_c": reference_c, "temp_coeff_ppm_per_c": None,
+                  "daily": [], "trend_ppm_per_month": None}
+        if len(rows) < 60:
+            return result
+        n = len(rows)
+        mean_t = sum(t for _, _, t in rows) / n
+        mean_f = sum(f for _, f, _ in rows) / n
+        var_t = sum((t - mean_t) ** 2 for _, _, t in rows)
+        slope = (sum((t - mean_t) * (f - mean_f) for _, f, t in rows) / var_t
+                 if var_t > 0 else 0.0)
+        result["temp_coeff_ppm_per_c"] = round(slope, 5)
+        by_day = {}
+        for ts, f, t in rows:
+            by_day.setdefault(ts // 86400, []).append(f - slope * (t - reference_c))
+        daily = [(day * 86400, sum(v) / len(v)) for day, v in sorted(by_day.items())
+                 if len(v) >= 60]   # at least an hour of data that day
+        result["daily"] = [[day, round(v, 4)] for day, v in daily]
+        if len(daily) >= 3:
+            xs = [d / 86400 for d, _ in daily]
+            ys = [v for _, v in daily]
+            mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+            vx = sum((x - mx) ** 2 for x in xs)
+            if vx > 0:
+                per_day = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=True)) / vx
+                result["trend_ppm_per_month"] = round(per_day * 30, 4)
+        return result
+
+    def query(self, seconds, points=HISTORY_POINTS, now=None):
+        """Averages over `points` equal buckets covering the last `seconds`.
+
+        Returns {"start", "step", "fields": {name: [value or None, ...]}}.
+        Health is the worst value in each bucket rather than the average, so a
+        short fault still shows.
+        """
+        now = int(now if now is not None else time.time())
+        start = now - seconds
+        step = seconds / points
+        names = [name for name, _ in HISTORY_FIELDS]
+        rows = self._rows(start, names)
         sums = [[0.0] * points for _ in names]
         counts = [[0] * points for _ in names]
         worst = [None] * points
@@ -1427,7 +1689,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             cached = _history_cache.get(name)
             if cached is None or time.monotonic() - cached[0] >= 60:
-                cached = (time.monotonic(), HISTORY.query(HISTORY_RANGES[name]))
+                seconds = HISTORY_RANGES[name]
+                cached = (time.monotonic(), dict(HISTORY.query(seconds),
+                                                 summary=HISTORY.summary(seconds),
+                                                 ageing=HISTORY.ageing()))
                 _history_cache[name] = cached
             self.send_json(dict(cached[1], range=name))
         elif path in ("/", "/index.html"):
