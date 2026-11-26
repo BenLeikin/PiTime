@@ -13,7 +13,7 @@ https://ntp.pilg0re.net
 - **Stratum 1 NTP server** synchronized directly from GPS satellites
 - **Hardware PPS discipline** via GPIO for nanosecond-grade precision
 - **Mission-control web dashboard** with live satellite sky view, telemetry, and historical PPS jitter
-- **PTP (Precision Time Protocol) master** for sub-microsecond LAN-local time distribution
+- **PTP (Precision Time Protocol) master** for PTP-aware clients on the LAN (software timestamping, so microsecond-level)
 - **NTS (Network Time Security)** server for cryptographically authenticated time over the internet
 - **Auto-renewing TLS certificate** via acme.sh wildcard, synced from a separate reverse proxy host
 - **Low-jitter tuning** applied at boot: fixed CPU speed, a CPU kept free for the PPS interrupt, GPS in stationary mode
@@ -35,7 +35,7 @@ Real numbers from a running instance:
 | RMS offset | <1 microsecond |
 | Root delay | 1 nanosecond (minimum reported) |
 | Frequency stability | <0.05 ppm skew |
-| CPU usage | <5% on isolated core |
+| CPU usage | under 1% of the Pi (chrony, gpsd and the dashboard together) |
 | Cost | ~$90 total hardware |
 
 These are the Pi's own clock against GPS. What a client sees also depends on the network between it and the Pi: tens of microseconds over wired Ethernet, milliseconds over Wi-Fi.
