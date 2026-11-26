@@ -10,6 +10,7 @@ Usage:
 """
 
 import csv
+import gzip
 import subprocess
 import json
 import re
@@ -19,6 +20,7 @@ import os
 import time
 import hashlib
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from html import escape as html_escape
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlsplit
@@ -35,10 +37,29 @@ from datetime import datetime, timezone
 VISITOR_DATA_DIR = "/var/lib/chrony-dashboard"
 VISITOR_FILE = os.path.join(VISITOR_DATA_DIR, "visitors.json")
 VISITOR_ACTIVE_S = 120
+# The User-Agent is whatever the client sends, so bound everything it can grow.
+VISITOR_MAX_UNIQUE = 50000       # stored fingerprints (about 1 MB on disk)
+VISITOR_MAX_RECENT = 5000        # fingerprints tracked as "viewing now"
+VISITOR_SAVE_INTERVAL_S = 30     # write the file at most this often
 _visitor_lock = threading.Lock()
 _visitor_recent = {}  # fingerprint -> last_seen_epoch
 _visitor_unique = set()  # all-time set of fingerprints
 _visitor_loaded = False
+_visitor_dirty = False
+_visitor_last_save = 0.0
+_visitor_last_prune = 0.0
+
+# Reverse proxies whose X-Real-IP header is believed (--trusted-proxy).
+TRUSTED_PROXIES = set()
+
+
+def client_ip(peer_ip, headers):
+    """The viewer's address: X-Real-IP if a trusted proxy sent it, else the peer."""
+    if peer_ip in TRUSTED_PROXIES:
+        real = (headers.get("X-Real-IP") or "").strip()
+        if real:
+            return real[:64]
+    return peer_ip
 
 
 def _load_visitors():
@@ -64,21 +85,27 @@ def _save_visitors():
 
 
 def record_visitor(ip, ua):
-    fp = hashlib.sha256(f"{ip}|{ua}".encode()).hexdigest()[:16]
+    global _visitor_dirty, _visitor_last_save, _visitor_last_prune
+    fp = hashlib.sha256(f"{ip}|{ua[:256]}".encode()).hexdigest()[:16]
     now = time.time()
     with _visitor_lock:
         if not _visitor_loaded:
             _load_visitors()
-        _visitor_recent[fp] = now
-        # Prune anything inactive from the recent map
-        cutoff = now - VISITOR_ACTIVE_S
-        stale = [k for k, t in _visitor_recent.items() if t < cutoff]
-        for k in stale:
-            _visitor_recent.pop(k, None)
-        is_new = fp not in _visitor_unique
-        if is_new:
+        if now - _visitor_last_prune >= 1.0:
+            # Prune anything inactive from the recent map
+            cutoff = now - VISITOR_ACTIVE_S
+            for k in [k for k, t in _visitor_recent.items() if t < cutoff]:
+                del _visitor_recent[k]
+            _visitor_last_prune = now
+        if fp in _visitor_recent or len(_visitor_recent) < VISITOR_MAX_RECENT:
+            _visitor_recent[fp] = now
+        if fp not in _visitor_unique and len(_visitor_unique) < VISITOR_MAX_UNIQUE:
             _visitor_unique.add(fp)
+            _visitor_dirty = True
+        if _visitor_dirty and now - _visitor_last_save >= VISITOR_SAVE_INTERVAL_S:
             _save_visitors()
+            _visitor_dirty = False
+            _visitor_last_save = now
 
 
 def get_visitor_stats():
@@ -197,9 +224,13 @@ def parse_selectdata():
 
 
 def source_state(state_char, reach, select_state=None):
+    if state_char == "?" and reach in ("0", ""):
+        # Nothing received in the last 8 polls. Checked first: selectdata still
+        # says 'N' for a noselect source that has gone silent.
+        return "unreachable"
     if select_state == "N":
         return "noselect"
-    if state_char == "?" and reach not in ("0", ""):
+    if state_char == "?":
         # chrony also shows '?' for sources that answer but fail its tests.
         return "unusable"
     return SOURCE_STATES.get(state_char, state_char)
@@ -322,7 +353,47 @@ def _tail_lines(path, max_bytes=64 * 1024):
     return lines
 
 
-def parse_pps_history(refid="PPS", path=REFCLOCKS_LOG, limit=60):
+# Tail size that last held enough samples, per log file, so the usual case is
+# one read of the right size.
+_pps_window = {}
+
+
+def _pps_samples(lines, refid):
+    """Split one refclock's log lines into (filtered, per-pulse) cooked offsets."""
+    filtered, per_pulse = [], []
+    for line in lines:
+        if refid not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 9 or parts[2] != refid:
+            continue
+        cooked = safe_float(parts[7])
+        if cooked is None:
+            continue
+        (filtered if parts[3] == "-" else per_pulse).append(cooked)
+    return filtered, per_pulse
+
+
+def _recent_samples(path, refid, need, max_bytes):
+    """Read the end of one log, growing the tail until it holds `need` samples.
+
+    Returns (filtered, per_pulse, whole_file_was_read).
+    """
+    window = _pps_window.get(path, 64 * 1024)
+    size = os.path.getsize(path)
+    while True:
+        filtered, per_pulse = _pps_samples(_tail_lines(path, window), refid)
+        enough = (len(filtered) >= need
+                  or (not filtered and len(per_pulse) >= need))
+        if enough or window >= size or window >= max_bytes:
+            break
+        window *= 4
+    _pps_window[path] = window
+    return filtered, per_pulse, window >= size
+
+
+def parse_pps_history(refid="PPS", path=REFCLOCKS_LOG, limit=60,
+                      max_bytes=1024 * 1024):
     """Return the most recent filtered offsets (seconds) for one refclock.
 
     refclocks.log columns (chrony "log refclocks"):
@@ -333,20 +404,23 @@ def parse_pps_history(refid="PPS", path=REFCLOCKS_LOG, limit=60):
     the pulse phase (e.g. 6.97e-02), not the clock error. Filtered samples,
     one per poll, have "-" in DP/P/raw and carry the real offset. Use those,
     and fall back to per-pulse cooked offsets only if none are present.
+
+    Filtered samples are sparse (one per poll among ~2 per-pulse lines a
+    second), so the tail that is read grows until it holds `limit` of them.
+    Just after log rotation the previous log tops the list up.
     """
     try:
-        lines = _tail_lines(path)
+        filtered, per_pulse, whole_file = _recent_samples(path, refid, limit, max_bytes)
     except OSError:
         return []
-    filtered, per_pulse = [], []
-    for line in lines:
-        parts = line.split()
-        if len(parts) < 9 or parts[2] != refid:
-            continue
-        cooked = safe_float(parts[7])
-        if cooked is None:
-            continue
-        (filtered if parts[3] == "-" else per_pulse).append(cooked)
+    if len(filtered) < limit and whole_file:
+        try:
+            older, older_pulse, _ = _recent_samples(
+                path + ".1", refid, limit - len(filtered), max_bytes)
+            filtered = older + filtered
+            per_pulse = older_pulse + per_pulse
+        except OSError:
+            pass
     return (filtered or per_pulse)[-limit:]
 
 
@@ -354,15 +428,19 @@ def _read_gpsd(host="127.0.0.1", port=2947, timeout=3.0):
     """Return the latest (TPV, SKY) reports from gpsd.
 
     Sends ?POLL right after ?WATCH so gpsd answers with its cached fix at once
-    instead of us waiting for the next streamed report. Newer gpsd versions also
-    emit SKY reports that carry only DOPs; those are not used for the satellite
-    list, but their DOPs are kept.
+    instead of us waiting for the next streamed report. The POLL reply is
+    gpsd's whole current state, so reading stops there: if it lists no
+    satellites, none are in view, and waiting longer would only stall every
+    snapshot for the full timeout during a GPS outage. Newer gpsd versions also
+    stream SKY reports that carry only DOPs; those are not used for the
+    satellite list, but their DOPs are kept.
     """
     tpv = sky = dops = None
+    polled = False
     deadline = time.monotonic() + timeout
 
     def consider(obj):
-        nonlocal tpv, sky, dops
+        nonlocal tpv, sky, dops, polled
         cls = obj.get("class")
         if cls == "TPV" and obj.get("mode") is not None:
             tpv = obj
@@ -372,6 +450,7 @@ def _read_gpsd(host="127.0.0.1", port=2947, timeout=3.0):
             if any(k in obj for k in ("hdop", "pdop", "vdop")):
                 dops = obj
         elif cls == "POLL":
+            polled = True
             for t in obj.get("tpv") or []:
                 consider(dict(t, **{"class": "TPV"}))
             for s in obj.get("sky") or []:
@@ -380,7 +459,7 @@ def _read_gpsd(host="127.0.0.1", port=2947, timeout=3.0):
     with socket.create_connection((host, port), timeout=timeout) as s:
         s.sendall(b'?WATCH={"enable":true,"json":true};\n?POLL;\n')
         buf = b""
-        while time.monotonic() < deadline and not (tpv and sky):
+        while time.monotonic() < deadline and not (polled or (tpv and sky)):
             s.settimeout(max(0.05, deadline - time.monotonic()))
             try:
                 data = s.recv(8192)
@@ -403,6 +482,49 @@ def _read_gpsd(host="127.0.0.1", port=2947, timeout=3.0):
         except OSError:
             pass
     return tpv, sky, dops
+
+
+# How long the receiver has held a fix. gpsd does not report this, so it is
+# tracked here: get_gpsd_data() updates it on every snapshot, and a monitor
+# thread (started in main) polls every FIX_MONITOR_INTERVAL_S so the record is
+# continuous even when nobody has the page open.
+FIX_MONITOR_INTERVAL_S = 10.0
+_fix_lock = threading.Lock()
+_fix_state = {
+    "seen": False,     # has gpsd been observed at least once?
+    "since": None,     # epoch when the current unbroken fix was first observed
+    "exact": False,    # False if the fix was already there at the first look
+    "last_fix": None,  # epoch of the most recent observation with a fix
+}
+
+
+def _note_fix(tpv):
+    """Record one observation of gpsd (tpv=None: gpsd gave nothing)."""
+    has_fix = bool(tpv) and tpv.get("mode") in (2, 3)
+    now = time.time()
+    with _fix_lock:
+        first = not _fix_state["seen"]
+        _fix_state["seen"] = True
+        if has_fix:
+            if _fix_state["since"] is None:
+                _fix_state["since"] = now
+                _fix_state["exact"] = not first
+            _fix_state["last_fix"] = now
+        else:
+            _fix_state["since"] = None
+        return {"has_fix": has_fix,
+                "fix_since": _fix_state["since"],
+                "fix_since_exact": _fix_state["exact"],
+                "last_fix": _fix_state["last_fix"]}
+
+
+def _gps_monitor(interval=FIX_MONITOR_INTERVAL_S):
+    while True:
+        try:
+            _note_fix(_read_gpsd()[0])
+        except Exception:
+            _note_fix(None)
+        time.sleep(interval)
 
 
 def get_gpsd_data():
@@ -450,6 +572,7 @@ def get_gpsd_data():
 
         return {
             "available": True,
+            **_note_fix(tpv),
             "fix_mode": fix_mode,
             "fix_time": fix_time,
             "sats_used": sats_used,
@@ -462,6 +585,7 @@ def get_gpsd_data():
     except Exception as e:
         return {
             "available": False,
+            **_note_fix(None),
             "error": str(e),
             "satellites": [],
             "sats_used": 0, "sats_visible": 0, "best_snr": 0,
@@ -469,27 +593,44 @@ def get_gpsd_data():
         }
 
 
+CPU_MAX_WINDOW_S = 30
+_cpu_prev = None  # (monotonic time, {cpu: (idle, total)}) from the last call
+
+
+def _cpu_snapshot():
+    cores = {}
+    with open("/proc/stat") as f:
+        for line in f:
+            if line.startswith("cpu") and not line.startswith("cpu "):
+                parts = line.split()
+                vals = [int(x) for x in parts[1:8]]
+                cores[parts[0]] = (vals[3] + vals[4], sum(vals))
+    return cores
+
+
 def get_cpu_per_core():
+    """Per-core usage since the previous call.
+
+    Measuring across the gap between snapshots needs no sleep and averages
+    over a couple of seconds instead of a 0.2 s blip. Only the first call, or
+    one after a long idle gap, takes a short sample of its own.
+    """
+    global _cpu_prev
     try:
-        def snapshot():
-            cores = {}
-            with open("/proc/stat") as f:
-                for line in f:
-                    if line.startswith("cpu") and not line.startswith("cpu "):
-                        parts = line.split()
-                        cpu_id = parts[0]
-                        vals = [int(x) for x in parts[1:8]]
-                        idle = vals[3] + vals[4]
-                        total = sum(vals)
-                        cores[cpu_id] = (idle, total)
-            return cores
-        s1 = snapshot()
-        time.sleep(0.2)
-        s2 = snapshot()
+        now = time.monotonic()
+        prev = _cpu_prev
+        if prev is None or now - prev[0] > CPU_MAX_WINDOW_S:
+            prev = (now, _cpu_snapshot())
+            time.sleep(0.1)
+            now = time.monotonic()
+        current = _cpu_snapshot()
+        _cpu_prev = (now, current)
         result = []
-        for cpu_id in sorted(s1.keys()):
-            idle1, total1 = s1[cpu_id]
-            idle2, total2 = s2[cpu_id]
+        for cpu_id in sorted(current):
+            if cpu_id not in prev[1]:
+                continue
+            idle1, total1 = prev[1][cpu_id]
+            idle2, total2 = current[cpu_id]
             d_idle = idle2 - idle1
             d_total = total2 - total1
             usage = 100.0 * (1.0 - d_idle / d_total) if d_total > 0 else 0.0
@@ -539,6 +680,20 @@ def get_next_leap_second():
     return None
 
 
+def get_uptime():
+    """System uptime worded like `uptime -p`, read from /proc (no subprocess)."""
+    try:
+        with open("/proc/uptime") as f:
+            minutes = int(float(f.read().split()[0])) // 60
+    except Exception:
+        return "—"
+    days, rem = divmod(minutes, 1440)
+    hours, mins = divmod(rem, 60)
+    parts = [f"{n} {unit}{'' if n == 1 else 's'}"
+             for n, unit in ((days, "day"), (hours, "hour"), (mins, "minute")) if n]
+    return "up " + (", ".join(parts) or "0 minutes")
+
+
 def get_system_info():
     hostname = socket.gethostname()
     try:
@@ -548,7 +703,7 @@ def get_system_info():
         s.close()
     except Exception:
         ip = "—"
-    uptime_raw = run(["uptime", "-p"])
+    uptime_raw = get_uptime()
     temp_str = "—"
     try:
         with open("/sys/class/thermal/thermal_zone0/temp") as f:
@@ -583,6 +738,7 @@ def get_system_info():
         "memory": mem_str,
         "loadavg": load_str,
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "epoch": time.time(),
         "isolated_cpus": get_isolated_cpus(),
     }
 
@@ -621,35 +777,30 @@ def compute_health(tracking, sources, gps):
     return {"status": status, "issues": issues}
 
 
+# The collectors mostly wait on chronyc, gpsd or files, so running them side
+# by side makes a snapshot take as long as the slowest one, not the sum.
+_COLLECT_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="collect")
+
+
 def get_all_data():
-    tracking = parse_tracking()
-    sources = parse_sources()
-    sourcestats = parse_sourcestats()
-    clients = parse_clients()
-    serverstats = parse_serverstats()
-    activity = parse_activity()
-    gps = get_gpsd_data()
-    cpu_cores = get_cpu_per_core()
-    pps_irq = get_pps_irq_count()
-    next_leap = get_next_leap_second()
-    pps_history = parse_pps_history(CONFIG["pps_refid"])
-    system = get_system_info()
-    health = compute_health(tracking, sources, gps)
-    return {
-        "tracking":    tracking,
-        "sources":     sources,
-        "sourcestats": sourcestats,
-        "clients":     clients,
-        "serverstats": serverstats,
-        "activity":    activity,
-        "gps":         gps,
-        "cpu_cores":   cpu_cores,
-        "pps_irq":     pps_irq,
-        "next_leap":   next_leap,
-        "pps_history": pps_history,
-        "system":      system,
-        "health":      health,
+    jobs = {
+        "tracking":    parse_tracking,
+        "sources":     parse_sources,
+        "sourcestats": parse_sourcestats,
+        "clients":     parse_clients,
+        "serverstats": parse_serverstats,
+        "activity":    parse_activity,
+        "gps":         get_gpsd_data,
+        "cpu_cores":   get_cpu_per_core,
+        "pps_irq":     get_pps_irq_count,
+        "next_leap":   get_next_leap_second,
+        "pps_history": lambda: parse_pps_history(CONFIG["pps_refid"]),
+        "system":      get_system_info,
     }
+    futures = {name: _COLLECT_POOL.submit(fn) for name, fn in jobs.items()}
+    data = {name: future.result() for name, future in futures.items()}
+    data["health"] = compute_health(data["tracking"], data["sources"], data["gps"])
+    return data
 
 
 HTML = r"""<!DOCTYPE html>
@@ -1023,6 +1174,10 @@ HTML = r"""<!DOCTYPE html>
   @keyframes blink {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.3; }
+  }
+  .tx-indicator.down { color: var(--red); border-color: var(--red); }
+  .tx-indicator.down::before {
+    background: var(--red); box-shadow: 0 0 8px var(--red); animation: none;
   }
 
   .banner {
@@ -1496,7 +1651,7 @@ HTML = r"""<!DOCTYPE html>
       <dt>Uptime</dt><dd id="h-uptime">—</dd>
       <dt>Core Temp</dt><dd id="h-temp">—</dd>
       <dt>Mission Time</dt><dd id="h-ts" style="font-size: 0.65rem">—</dd>
-      <dt>Status</dt><dd><span class="tx-indicator">TRANSMITTING</span></dd>
+      <dt>Status</dt><dd><span class="tx-indicator" id="tx-indicator">CHECKING</span></dd>
     </dl>
   </header>
 
@@ -1681,8 +1836,12 @@ HTML = r"""<!DOCTYPE html>
 
 <script>
 const REFRESH_S = 5;
-let lastFixTime = null;
-let lastFixServerTimeMs = null;
+// Set by render() from the server's own record of the GPS fix; the ticker
+// below only adds the time since that snapshot arrived.
+let fixInfo = null;
+let lastGoodAt = null;   // performance.now() of the last successful poll
+let linkLost = false;
+let fetching = false;
 
 function reachBits(octal) {
   let dec = parseInt(octal, 8);
@@ -1752,14 +1911,27 @@ let satsCurrent = [];
 let satsAnimated = [];
 let radarAngle = 0;
 
+// Setting canvas.width reallocates and clears the canvas, so do it only when
+// the size really changes, and keep the size for drawSky() to reuse.
+let canvasW = 0;
+let canvasH = 0;
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
-  canvas.width = rect.width * dpr;
-  canvas.height = rect.height * dpr;
+  const pxW = Math.round(rect.width * dpr);
+  const pxH = Math.round(rect.height * dpr);
+  canvasW = rect.width;
+  canvasH = rect.height;
+  if (canvas.width !== pxW || canvas.height !== pxH) {
+    canvas.width = pxW;
+    canvas.height = pxH;
+  }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 window.addEventListener('resize', resizeCanvas);
+if (typeof ResizeObserver === 'function') {
+  new ResizeObserver(resizeCanvas).observe(canvas);
+}
 
 function projectSat(el, az, w, h) {
   const cx = w / 2;
@@ -1774,10 +1946,8 @@ function projectSat(el, az, w, h) {
 }
 
 function drawSky() {
-  resizeCanvas();
-  const rect = canvas.getBoundingClientRect();
-  const w = rect.width;
-  const h = rect.height;
+  const w = canvasW;
+  const h = canvasH;
   ctx.clearRect(0, 0, w, h);
 
   const cx = w / 2;
@@ -1804,7 +1974,6 @@ function drawSky() {
     ctx.arc(cx, cy, r, 0, 2 * Math.PI);
     ctx.fill();
   }
-  radarAngle += 0.012;
 
   ctx.strokeStyle = 'rgba(45,74,120,0.4)';
   ctx.lineWidth = 1;
@@ -1890,21 +2059,35 @@ function drawSky() {
   ctx.fill();
 }
 
-function animateSats() {
+// The sky changes slowly, so 20 frames a second is plenty; the sweep angle
+// follows the clock so its speed does not depend on the frame rate.
+const SKY_FRAME_MS = 50;
+let lastSkyDraw = 0;
+function animateSats(now) {
+  requestAnimationFrame(animateSats);
+  if (now - lastSkyDraw < SKY_FRAME_MS) return;
+  lastSkyDraw = now;
+  radarAngle = (now / 1000) * 0.72;
   for (let i = 0; i < satsAnimated.length; i++) {
     const sat = satsAnimated[i];
     const target = satsCurrent.find(s => s.prn === sat.prn);
     if (target) {
-      const dEl = target.el - sat.el;
-      const dAz = target.az - sat.az;
-      sat.el += dEl * 0.06;
-      sat.az += dAz * 0.06;
+      if (target.el == null || target.az == null || sat.el == null || sat.az == null) {
+        // Position unknown on one side: nothing to ease between.
+        sat.el = target.el;
+        sat.az = target.az;
+      } else {
+        const dEl = target.el - sat.el;
+        // Take the short way round the compass (359 -> 1 is +2, not -358).
+        const dAz = ((target.az - sat.az + 540) % 360) - 180;
+        sat.el += dEl * 0.17;
+        sat.az = (sat.az + dAz * 0.17 + 360) % 360;
+      }
       sat.ss = target.ss;
       sat.used = target.used;
     }
   }
   drawSky();
-  requestAnimationFrame(animateSats);
 }
 
 function updateSats(newSats) {
@@ -2083,13 +2266,46 @@ function updatePacificClock() {
 requestAnimationFrame(updatePacificClock);
 
 function updateFixAge() {
-  if (lastFixTime && lastFixServerTimeMs) {
-    const elapsedMs = Date.now() - lastFixServerTimeMs;
-    const fixAge = Math.floor(elapsedMs / 1000);
-    setText('g-fix-age', formatDuration(fixAge));
+  const el = document.getElementById('g-fix-age');
+  if (!el) return;
+  if (!fixInfo || linkLost) {
+    el.textContent = '\u2014';
+    el.className = 'stat-val';
+    return;
+  }
+  const sinceFetch = (performance.now() - fixInfo.fetchedAt) / 1000;
+  if (fixInfo.lockedS != null) {
+    // "> " when the fix was already there the first time the server looked.
+    el.textContent = (fixInfo.exact ? '' : '> ') + formatDuration(fixInfo.lockedS + sinceFetch);
+    el.className = 'stat-val good';
+  } else if (fixInfo.lostS != null) {
+    el.textContent = 'no fix for ' + formatDuration(fixInfo.lostS + sinceFetch);
+    el.className = 'stat-val bad';
+  } else {
+    el.textContent = 'no fix';
+    el.className = 'stat-val bad';
   }
 }
-setInterval(updateFixAge, 1000);
+
+// When polls fail, say so where the status is, and how old the data is.
+function showLinkLost() {
+  linkLost = true;
+  const banner = document.getElementById('status-banner');
+  banner.classList.remove('ok', 'degraded');
+  banner.classList.add('fault');
+  setText('status-text', '\u2715 TELEMETRY LINK LOST');
+  setText('status-issues', lastGoodAt == null
+    ? 'no data received yet'
+    : 'showing data from ' + formatDuration((performance.now() - lastGoodAt) / 1000) + ' ago');
+  const tx = document.getElementById('tx-indicator');
+  tx.textContent = 'NO LINK';
+  tx.classList.add('down');
+  updateFixAge();
+}
+
+setInterval(() => {
+  if (linkLost) showLinkLost(); else updateFixAge();
+}, 1000);
 
 function render(d) {
   const { tracking: t, sources, sourcestats, clients, serverstats: ss, activity,
@@ -2138,10 +2354,19 @@ function render(d) {
   }
   setText('g-alt', gps.alt != null ? gps.alt.toFixed(1) + ' m' : '\u2014');
 
-  if (gps.fix_time && gps.fix_time !== lastFixTime) {
-    lastFixTime = gps.fix_time;
-    lastFixServerTimeMs = Date.now();
-  }
+  // Durations are worked out against the server's clock (s.epoch), so a wrong
+  // clock on the viewer's machine does not change them.
+  fixInfo = {
+    lockedS: gps.has_fix && gps.fix_since != null ? s.epoch - gps.fix_since : null,
+    exact: !!gps.fix_since_exact,
+    lostS: gps.last_fix != null ? s.epoch - gps.last_fix : null,
+    fetchedAt: performance.now(),
+  };
+  updateFixAge();
+
+  const tx = document.getElementById('tx-indicator');
+  tx.textContent = health.status === 'FAULT' ? 'NOT SYNCED' : 'TRANSMITTING';
+  tx.classList.toggle('down', health.status === 'FAULT');
 
   colorizeOffset(t.last_offset, 'h-sys-offset');
   setText('h-rms-offset', 'RMS ' + t.rms_offset);
@@ -2452,7 +2677,7 @@ const GLOSSARY = {
   'Uptime': 'How long the chrony daemon has been continuously running since the last boot or restart.',
   'Core Temp': 'Temperature of the CPU. Affects the local oscillator frequency. Stable temperatures yield more stable clocks.',
   'Mission Time': 'The current system time as reported by the server, in UTC. Refreshed each time telemetry is fetched.',
-  'Status': 'Overall transmit indicator. TRANSMITTING means the NTP daemon is actively serving time to clients on the network.',
+  'Status': 'TRANSMITTING means chrony has a synchronised source and is serving time. NOT SYNCED means it has none. NO LINK means this page cannot reach the dashboard server, so everything shown is old.',
 
   // GPS Subsystem
   'Fix Mode': '3D means latitude, longitude, and altitude are all being computed. 2D means altitude is unavailable. No Fix means the receiver cannot solve a position.',
@@ -2462,7 +2687,7 @@ const GLOSSARY = {
   'PDOP': 'Position Dilution of Precision. Combines horizontal and vertical geometry. Lower means the satellites are well-distributed for an accurate 3D fix.',
   'Position': 'Latitude and longitude of the antenna, computed from satellite signals. Accuracy is typically a few meters with a good fix.',
   'Altitude': 'Height above the WGS84 ellipsoid (approximately mean sea level). Typically less accurate than horizontal position due to satellite geometry.',
-  'Time Since Lock': 'How long the receiver has held a continuous fix without losing lock on enough satellites.',
+  'Time Since Lock': 'How long the receiver has held a fix without a break, as tracked by this dashboard (checked every 10 seconds). A leading ">" means the fix was already there when the dashboard started, so the true figure is longer.',
 
   // Offset / Stratum / Frequency
   'System Offset': 'The estimated difference between your system clock and the true reference time. Smaller is better; near-zero values indicate excellent discipline.',
@@ -2618,18 +2843,29 @@ function attachTooltips(root) {
 document.addEventListener('click', _hideTip);
 
 async function fetchData() {
+  if (fetching) return;  // the previous poll has not finished; do not pile up
+  fetching = true;
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), 10000);
   try {
-    const res = await fetch('/api/status');
+    const res = await fetch('/api/status', { signal: abort.signal, cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     const wasHidden = document.getElementById('dashboard').style.display !== 'block';
     document.getElementById('loading').style.display = 'none';
     document.getElementById('dashboard').style.display = 'block';
-    if (wasHidden) { requestAnimationFrame(() => { resizeCanvas(); drawSky(); }); }
+    if (wasHidden) { requestAnimationFrame(resizeCanvas); }
+    linkLost = false;
     render(data);
+    lastGoodAt = performance.now();
     attachTooltips();
   } catch (e) {
     document.getElementById('loading').textContent = '\u2715 TELEMETRY LINK FAILED';
+    showLinkLost();
     console.error(e);
+  } finally {
+    clearTimeout(timer);
+    fetching = false;
   }
   startProgress();
 }
@@ -2647,10 +2883,10 @@ setInterval(fetchData, REFRESH_S * 1000);
 class StatusCache:
     """Share one data snapshot between all viewers.
 
-    Collecting a snapshot runs several chronyc commands, samples CPU for 0.2s
-    and talks to gpsd, so it takes a while. Every viewer polls every few
-    seconds; without this, each poll would repeat that work. Concurrent
-    requests that arrive while a refresh is running wait for it and reuse it.
+    Collecting a snapshot runs several chronyc commands and talks to gpsd.
+    Every viewer polls every few seconds; without this, each poll would
+    repeat that work. Concurrent requests that arrive while a refresh is
+    running wait for it and reuse it.
     """
 
     def __init__(self, ttl):
@@ -2697,11 +2933,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def _send(self, status, body, content_type, cache="no-store"):
+    def _send(self, status, body, content_type, cache="no-store", extra=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", cache)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         for k, v in SECURITY_HEADERS.items():
             self.send_header(k, v)
         self.end_headers()
@@ -2712,19 +2950,28 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(data, default=str).encode()
         self._send(status, body, "application/json")
 
-    def send_html(self, html):
-        self._send(200, html.encode(), "text/html; charset=utf-8")
+    def send_page(self):
+        # The page is fixed after startup, so it is encoded and gzipped once.
+        extra = {"Vary": "Accept-Encoding"}
+        body = PAGE_BYTES
+        if "gzip" in self.headers.get("Accept-Encoding", ""):
+            body = PAGE_GZIP
+            extra["Content-Encoding"] = "gzip"
+        self._send(200, body, "text/html; charset=utf-8", extra=extra)
+
+    def _record_visitor(self):
+        try:
+            record_visitor(client_ip(self.client_address[0], self.headers),
+                           self.headers.get("User-Agent", "unknown"))
+        except Exception:
+            pass
 
     def do_GET(self):
         path = urlsplit(self.path).path
 
         if path == "/api/status":
             # Record viewer activity on API polls (the page polls while open).
-            try:
-                record_visitor(self.client_address[0],
-                               self.headers.get("User-Agent", "unknown"))
-            except Exception:
-                pass
+            self._record_visitor()
             try:
                 self.send_json(STATUS_CACHE.get())
             except Exception as e:
@@ -2740,12 +2987,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self.send_json({"status": "ERROR"}, status=500)
         elif path in ("/", "/index.html"):
-            try:
-                record_visitor(self.client_address[0],
-                               self.headers.get("User-Agent", "unknown"))
-            except Exception:
-                pass
-            self.send_html(PAGE_HTML)
+            self._record_visitor()
+            self.send_page()
         else:
             self._send(404, b"not found\n", "text/plain; charset=utf-8")
 
@@ -2758,8 +3001,14 @@ class DashboardServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+def set_page(html):
+    global PAGE_HTML, PAGE_BYTES, PAGE_GZIP
+    PAGE_HTML = html
+    PAGE_BYTES = html.encode()
+    PAGE_GZIP = gzip.compress(PAGE_BYTES, 9)
+
+
 def main():
-    global PAGE_HTML
     parser = argparse.ArgumentParser(description="Chrony GPS Dashboard - Space-Age")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--bind", default="0.0.0.0")
@@ -2767,10 +3016,15 @@ def main():
                         help="refid of the PPS refclock in chrony.conf (default: PPS)")
     parser.add_argument("--cache-ttl", type=float, default=2.0,
                         help="seconds to reuse one data snapshot across viewers (default: 2)")
+    parser.add_argument("--trusted-proxy", action="append", default=[], metavar="IP",
+                        help="reverse proxy whose X-Real-IP header gives the real "
+                             "visitor address (repeatable)")
     args = parser.parse_args()
     CONFIG["pps_refid"] = args.pps_refid
     STATUS_CACHE.ttl = args.cache_ttl
-    PAGE_HTML = HTML.replace("{hostname}", html_escape(socket.gethostname()))
+    TRUSTED_PROXIES.update(args.trusted_proxy)
+    set_page(HTML.replace("{hostname}", html_escape(socket.gethostname())))
+    threading.Thread(target=_gps_monitor, name="gps-monitor", daemon=True).start()
 
     server = DashboardServer((args.bind, args.port), Handler)
     print(f"[chrony-dashboard] Listening on http://{args.bind}:{args.port}", flush=True)
@@ -2780,7 +3034,7 @@ def main():
         print("\n[chrony-dashboard] Stopped.")
 
 
-PAGE_HTML = HTML
+set_page(HTML)
 
 
 if __name__ == "__main__":

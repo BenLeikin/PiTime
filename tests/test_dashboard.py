@@ -287,5 +287,147 @@ class CacheTests(unittest.TestCase):
         self.assertIsNot(a, b)
 
 
+class SourceStateTests(unittest.TestCase):
+    def test_silent_noselect_source_is_unreachable(self):
+        # selectdata keeps saying N for a noselect refclock that has gone quiet.
+        self.assertEqual(cd.source_state("?", "0", "N"), "unreachable")
+        self.assertEqual(cd.source_state("?", "377", "N"), "noselect")
+        self.assertEqual(cd.source_state("?", "377", None), "unusable")
+        self.assertEqual(cd.source_state("*", "377", "*"), "synced")
+
+
+class PpsWindowTests(unittest.TestCase):
+    PULSE = "2026-11-25 10:00:00.000000 PPS    %2d N 1  6.97e-02  6.97e-02  3.7e-08\n"
+    NMEA = "2026-11-25 10:00:00.100000 NMEA   %2d N 0  5.4e-06  5.1e-06  1.0e-03\n"
+    FILTERED = "2026-11-25 10:00:00.300000 PPS     - N -       -       %.6e  2.1e-07\n"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "refclocks.log")
+        cd._pps_window.clear()
+
+    def tearDown(self):
+        for name in os.listdir(self.dir):
+            os.unlink(os.path.join(self.dir, name))
+        os.rmdir(self.dir)
+
+    def _write(self, path, first, count):
+        """One filtered sample per 16 seconds of per-pulse lines, like the Pi."""
+        with open(path, "w") as f:
+            for i in range(first, first + count):
+                for dp in range(16):
+                    f.write(self.PULSE % dp)
+                    f.write(self.NMEA % dp)
+                f.write(self.FILTERED % (i * 1e-9))
+
+    def test_reads_far_enough_back_for_a_full_chart(self):
+        self._write(self.path, 0, 200)   # ~500 KiB; 64 KiB holds only ~25 samples
+        samples = cd.parse_pps_history("PPS", self.path)
+        self.assertEqual(len(samples), 60)
+        self.assertAlmostEqual(samples[-1], 199e-9)
+        self.assertAlmostEqual(samples[0], 140e-9)
+
+    def test_tops_up_from_rotated_log(self):
+        self._write(self.path + ".1", 0, 100)
+        self._write(self.path, 100, 5)   # just rotated: only 5 samples so far
+        samples = cd.parse_pps_history("PPS", self.path)
+        self.assertEqual(len(samples), 60)
+        self.assertAlmostEqual(samples[-1], 104e-9)
+        self.assertAlmostEqual(samples[0], 45e-9)
+
+
+class GpsdPollTests(unittest.TestCase):
+    def setUp(self):
+        cd._fix_state.update(seen=False, since=None, exact=False, last_fix=None)
+
+    def test_poll_without_satellites_returns_at_once(self):
+        # During an outage gpsd has a TPV but no satellites; do not wait for any.
+        fake = FakeGpsd([
+            {"class": "VERSION", "release": "3.22"},
+            {"class": "POLL", "tpv": [{"mode": 1, "time": "2026-11-25T10:00:00.000Z"}],
+             "sky": [{"satellites": []}]},
+        ])
+        try:
+            start = cd.time.monotonic()
+            tpv, sky, _ = cd._read_gpsd(port=fake.port, timeout=3.0)
+            elapsed = cd.time.monotonic() - start
+        finally:
+            fake.close()
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(tpv["mode"], 1)
+        self.assertIsNone(sky)
+
+    def test_fix_tracking(self):
+        with mock.patch.object(cd.time, "time", return_value=1000.0):
+            first = cd._note_fix({"mode": 3})
+        self.assertEqual((first["has_fix"], first["fix_since"]), (True, 1000.0))
+        self.assertFalse(first["fix_since_exact"])  # already locked at first look
+        with mock.patch.object(cd.time, "time", return_value=1010.0):
+            lost = cd._note_fix({"mode": 1})
+        self.assertEqual((lost["has_fix"], lost["fix_since"], lost["last_fix"]),
+                         (False, None, 1000.0))
+        with mock.patch.object(cd.time, "time", return_value=1020.0):
+            again = cd._note_fix({"mode": 2})
+        self.assertEqual(again["fix_since"], 1020.0)
+        self.assertTrue(again["fix_since_exact"])   # we saw this lock begin
+        with mock.patch.object(cd.time, "time", return_value=1030.0):
+            self.assertEqual(cd._note_fix({"mode": 3})["fix_since"], 1020.0)
+            self.assertIsNone(cd._note_fix(None)["fix_since"])  # gpsd down
+
+
+class VisitorTests(unittest.TestCase):
+    def setUp(self):
+        self._saved = (cd._visitor_recent.copy(), set(cd._visitor_unique),
+                       cd._visitor_loaded, set(cd.TRUSTED_PROXIES))
+        cd._visitor_recent.clear()
+        cd._visitor_unique.clear()
+        cd._visitor_loaded = True
+        cd.TRUSTED_PROXIES.clear()
+        self.saves = []
+        patcher = mock.patch.object(cd, "_save_visitors", lambda: self.saves.append(1))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        recent, unique, loaded, proxies = self._saved
+        cd._visitor_recent.clear()
+        cd._visitor_recent.update(recent)
+        cd._visitor_unique.clear()
+        cd._visitor_unique.update(unique)
+        cd._visitor_loaded = loaded
+        cd.TRUSTED_PROXIES.clear()
+        cd.TRUSTED_PROXIES.update(proxies)
+
+    def test_real_ip_only_from_trusted_proxy(self):
+        headers = {"X-Real-IP": "203.0.113.7"}
+        self.assertEqual(cd.client_ip("10.0.0.69", headers), "10.0.0.69")
+        cd.TRUSTED_PROXIES.add("10.0.0.69")
+        self.assertEqual(cd.client_ip("10.0.0.69", headers), "203.0.113.7")
+        self.assertEqual(cd.client_ip("198.51.100.1", headers), "198.51.100.1")
+        self.assertEqual(cd.client_ip("10.0.0.69", {}), "10.0.0.69")
+
+    def test_unique_set_is_capped_and_saves_are_throttled(self):
+        with mock.patch.object(cd, "VISITOR_MAX_UNIQUE", 5), \
+             mock.patch.object(cd, "_visitor_last_save", 0.0):
+            for i in range(50):
+                cd.record_visitor("203.0.113.7", f"agent-{i}")
+        self.assertEqual(len(cd._visitor_unique), 5)
+        self.assertEqual(len(self.saves), 1)   # not one write per new visitor
+
+
+class SystemTests(unittest.TestCase):
+    def test_cpu_usage_needs_no_sleep_after_first_call(self):
+        cd.get_cpu_per_core()
+        with mock.patch.object(cd.time, "sleep",
+                               side_effect=AssertionError("slept")):
+            cores = cd.get_cpu_per_core()
+        self.assertTrue(cores)
+        self.assertTrue(all(0.0 <= c["usage"] <= 100.0 for c in cores))
+
+    def test_uptime_wording(self):
+        with mock.patch("builtins.open", mock.mock_open(read_data="93784.21 1.0\n")):
+            self.assertEqual(cd.get_uptime(), "up 1 day, 2 hours, 3 minutes")
+
+
 if __name__ == "__main__":
     unittest.main()
