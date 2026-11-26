@@ -131,3 +131,9 @@ The PPS jitter chart reads `/var/log/chrony/refclocks.log`, so
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## License
+
+[MIT](LICENSE). The dashboard page loads the Orbitron and Space Mono fonts from
+Google Fonts at view time; they are not part of this repository and are
+licensed separately (SIL Open Font License).
