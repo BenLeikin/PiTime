@@ -144,6 +144,23 @@ if [[ $WITH_CONFIGS -eq 1 ]]; then
     /etc/systemd/system/timeserver-tune.service || true
   systemctl daemon-reload
   systemctl enable timeserver-tune.service >/dev/null 2>&1
+  # Receiver for pushed NTS certificates (see scripts/sync-nts-cert.sh.example).
+  install_config usr/local/sbin/nts-cert-receiver /usr/local/sbin/nts-cert-receiver 0755 || true
+
+  # SSH hardening. A broken sshd config locks everyone out, so check it with
+  # sshd -t and put the old file back if the check fails.
+  ssh_conf=/etc/ssh/sshd_config.d/01-timeserver.conf
+  ssh_old=""
+  [[ -f "$ssh_conf" ]] && ssh_old="$(cat "$ssh_conf")"
+  if install_config site/etc/ssh/sshd_config.d/01-timeserver.conf "$ssh_conf"; then
+    if sshd -t; then
+      systemctl reload ssh
+    else
+      if [[ -n "$ssh_old" ]]; then printf '%s\n' "$ssh_old" > "$ssh_conf"; else rm -f "$ssh_conf"; fi
+      echo "    WARNING: new SSH settings failed sshd -t; previous settings kept" >&2
+    fi
+  fi
+
   # Hardware watchdog: systemd reads its own config only on (re)execution.
   if install_config etc/systemd/system.conf.d/90-timeserver-watchdog.conf \
       /etc/systemd/system.conf.d/90-timeserver-watchdog.conf; then

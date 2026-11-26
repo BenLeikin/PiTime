@@ -210,7 +210,13 @@ Note: the Pi 4's onboard NIC does not have hardware timestamping support, so PTP
 
 Requires a TLS certificate covering your time server's hostname.
 
-If you already have a wildcard cert managed elsewhere, see `scripts/sync-nts-cert.sh.example` for a renewal hook that pushes the cert to this server via SSH. Run it from the ACME client after each renewal and also daily from cron: it skips the push when the certificate is already in place, and a push that failed is retried the next day instead of leaving the time server on an expiring certificate.
+If you already have a wildcard cert managed elsewhere, see `scripts/sync-nts-cert.sh.example` for a renewal hook that pushes the cert to this server via SSH. The key it uses logs in as root but is locked to one job: `install.sh --configs` installs `/usr/local/sbin/nts-cert-receiver`, and the key's line in `/root/.ssh/authorized_keys` forces it:
+
+```
+from="<renewing host>",restrict,command="/usr/local/sbin/nts-cert-receiver" ssh-ed25519 AAAA... cert-sync
+```
+
+Whatever that key asks for, it can only check the installed certificate's fingerprint, install a new certificate or key (each is checked before it replaces the old one), and restart chrony. Run it from the ACME client after each renewal and also daily from cron: it skips the push when the certificate is already in place, and a push that failed is retried the next day instead of leaving the time server on an expiring certificate.
 
 If issuing fresh on this server, install acme.sh or certbot and point chrony at the cert files.
 
@@ -251,6 +257,10 @@ The last two are also saved in the receiver's battery-backed memory (`ubxtool -p
 Check it with `journalctl -u timeserver-tune`. To undo it, `sudo systemctl disable timeserver-tune` and reboot.
 
 For temperature compensation, the repository's `chrony.conf` logs the CPU temperature (`tempcomp ... 0 0 0 0`, which applies no correction). After a few days of logging, run `tools/fit_tempcomp.py --host <pi>` from a workstation; it prints the `tempcomp` line to put in `chrony.conf`, or says why there is not enough data yet.
+
+### SSH
+
+`install.sh --configs` installs `site/etc/ssh/sshd_config.d/01-timeserver.conf`: SSH keys work from anywhere, passwords only from your own network, and X11 forwarding is off. The account used for deploys has passwordless sudo, so a guessed password would be root. Set the address range in that file to your LAN (or delete its `Match` block to allow keys only) before installing. The installer checks the result with `sshd -t` and keeps the previous settings if the check fails.
 
 ### Updates and the watchdog
 

@@ -46,6 +46,7 @@ FILES=(
   etc/systemd/system.conf.d/90-timeserver-watchdog.conf
   etc/apt/apt.conf.d/20auto-upgrades
   etc/apt/apt.conf.d/52timeserver-unattended-upgrades
+  usr/local/sbin/nts-cert-receiver
 )
 
 if command -v git >/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then
@@ -90,7 +91,9 @@ systemd/timeserver-tune.service:/etc/systemd/system/timeserver-tune.service \
 site/etc/systemd/system/gitlab-runner.service.d/timeserver.conf:/etc/systemd/system/gitlab-runner.service.d/timeserver.conf \
 etc/systemd/system.conf.d/90-timeserver-watchdog.conf:/etc/systemd/system.conf.d/90-timeserver-watchdog.conf \
 etc/apt/apt.conf.d/20auto-upgrades:/etc/apt/apt.conf.d/20auto-upgrades \
-etc/apt/apt.conf.d/52timeserver-unattended-upgrades:/etc/apt/apt.conf.d/52timeserver-unattended-upgrades"
+etc/apt/apt.conf.d/52timeserver-unattended-upgrades:/etc/apt/apt.conf.d/52timeserver-unattended-upgrades \
+usr/local/sbin/nts-cert-receiver:/usr/local/sbin/nts-cert-receiver \
+site/etc/ssh/sshd_config.d/01-timeserver.conf:/etc/ssh/sshd_config.d/01-timeserver.conf"
 
 # Lines install.sh --configs would add to the Pi's boot config.
 boot_diff() {

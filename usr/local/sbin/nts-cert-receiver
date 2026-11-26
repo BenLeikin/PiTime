@@ -1,0 +1,60 @@
+#!/bin/bash
+# Forced command for the key that pushes the NTS certificate to this server.
+#
+# The host that renews the certificate logs in as root with a key whose line
+# in /root/.ssh/authorized_keys reads:
+#
+#   from="<renewing host>",restrict,command="/usr/local/sbin/nts-cert-receiver" ssh-ed25519 AAAA... cert-sync
+#
+# so whatever command it asks for, sshd runs this script instead and passes
+# the request in SSH_ORIGINAL_COMMAND. Only these requests are carried out:
+#
+#   fingerprint          print the SHA-256 fingerprint of the installed certificate
+#   put fullchain.crt    install the certificate read from stdin
+#   put privkey.key      install the private key read from stdin
+#   restart              restart chrony so it loads them
+#
+# Anything else is refused. A stolen key can therefore at most replace the
+# NTS certificate with another valid one and restart chrony: no shell.
+set -euo pipefail
+
+DEST_DIR="${DEST_DIR:-/etc/chrony/nts}"
+MAX_BYTES=65536
+
+refuse() {
+  logger -p auth.warning -t nts-cert-receiver "refused: $*"
+  echo "nts-cert-receiver: $*" >&2
+  exit 1
+}
+
+# put <name> <mode> <check>: read stdin, check it parses, then swap it in.
+put() {
+  local name="$1" mode="$2" tmp
+  tmp="$(mktemp "$DEST_DIR/.$name.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+  head -c "$((MAX_BYTES + 1))" > "$tmp"
+  [ "$(stat -c %s "$tmp")" -le "$MAX_BYTES" ] || refuse "$name is larger than $MAX_BYTES bytes"
+  case "$name" in
+    fullchain.crt) openssl x509 -in "$tmp" -noout 2>/dev/null || refuse "$name is not a certificate" ;;
+    privkey.key)   openssl pkey -in "$tmp" -noout 2>/dev/null || refuse "$name is not a private key" ;;
+  esac
+  chmod "$mode" "$tmp"
+  chown _chrony:_chrony "$tmp"
+  mv "$tmp" "$DEST_DIR/$name"
+  trap - EXIT
+  logger -t nts-cert-receiver "installed $DEST_DIR/$name"
+}
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  fingerprint)
+    openssl x509 -in "$DEST_DIR/fullchain.crt" -noout -fingerprint -sha256 2>/dev/null || true ;;
+  "put fullchain.crt")
+    put fullchain.crt 644 ;;
+  "put privkey.key")
+    put privkey.key 600 ;;
+  restart)
+    systemctl restart chrony
+    logger -t nts-cert-receiver "restarted chrony" ;;
+  *)
+    refuse "request not allowed: '${SSH_ORIGINAL_COMMAND:-}'" ;;
+esac

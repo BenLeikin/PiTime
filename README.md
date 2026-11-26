@@ -133,6 +133,8 @@ Everything specific to one site (who may use the server, the NTS host name, the 
 | `systemd/chrony-webpage.service` | `/etc/systemd/system/` | Dashboard service (runs as `_chrony`, sandboxed) |
 | `site/etc/default/chrony-dashboard` | `/etc/default/` | **Site setting:** dashboard options (reverse proxy address, time zone) |
 | `site/etc/chrony/conf.d/site.conf` | `/etc/chrony/conf.d/` | **Site setting:** who may use the server, NTS certificate and host name |
+| `site/etc/ssh/sshd_config.d/01-timeserver.conf` | `/etc/ssh/sshd_config.d/` | **Site setting:** SSH with keys from anywhere, passwords only from the LAN; no X11 forwarding |
+| `usr/local/sbin/nts-cert-receiver` | `/usr/local/sbin/` | The only thing the certificate-sync key may run: installs a pushed NTS certificate |
 | `site/etc/systemd/system/gitlab-runner.service.d/timeserver.conf` | same path under `/` | **Site setting:** low priority for a GitLab CI runner on the Pi (installed only if a runner is) |
 | `etc/chrony/chrony.conf` | `/etc/chrony/` | chrony: PPS + NMEA refclocks, pools, rate limits, temperature logging |
 | `etc/default/gpsd` | `/etc/default/` | gpsd devices and options |

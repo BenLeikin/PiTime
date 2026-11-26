@@ -2,6 +2,14 @@
 
 Notable changes to this project. Versions follow [semantic versioning](https://semver.org/): the major number changes when an upgrade needs action on an existing install.
 
+## [2.2.1] - 2026-11-26
+
+### Security
+
+- The key that pushes the NTS certificate to the Pi as root is locked to one job: `nts-cert-receiver` carries out only "fingerprint", "put fullchain.crt", "put privkey.key" and "restart", checks that each file parses before installing it, and refuses anything else. Previously the key gave a full root shell to whoever held it.
+- SSH: passwords are accepted only from the LAN (keys from anywhere), and X11 forwarding is off. The deploy account has passwordless sudo, so a guessed password used to be root.
+- The certificate sync checks the Pi's host key strictly instead of trusting it on first use.
+
 ## [2.2.0] - 2026-11-26
 
 ### Added

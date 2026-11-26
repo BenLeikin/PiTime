@@ -13,6 +13,7 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 SHELL_SCRIPTS=(install.sh deploy.sh tools/check.sh usr/local/sbin/timeserver-tune
+               usr/local/sbin/nts-cert-receiver
                scripts/convert-to-chrony.sh scripts/sync-nts-cert.sh.example)
 failed=0
 
