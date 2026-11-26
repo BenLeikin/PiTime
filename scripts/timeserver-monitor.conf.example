@@ -1,0 +1,26 @@
+# Settings for scripts/health_monitor.py. Copy to
+# /etc/default/timeserver-monitor on the machine that runs it and make it
+# readable by root only (chmod 600): the webhook URL works like a password.
+
+# How the server is named in messages.
+NAME="time server"
+
+# The dashboard's health endpoint, reached directly (not through a reverse
+# proxy, so a proxy problem is not reported as a time server problem).
+HEALTH_URL=http://YOUR_TIME_SERVER_IP:8080/api/health
+
+# Also ask the NTP service itself for the time. Leave empty to skip.
+NTP_HOST=YOUR_TIME_SERVER_IP
+
+# Where alerts go: a Discord, Slack, Mattermost or Google Chat incoming
+# webhook. Leave empty to only log (cron mails the output).
+WEBHOOK_URL=
+
+# A change must be seen this many runs in a row before it is reported. With a
+# 5-minute cron job, 3 means 10-15 minutes, long enough to ignore a restart.
+THRESHOLD=3
+
+# While the server stays unhealthy, repeat the alert this often.
+REMIND_HOURS=24
+
+STATE_FILE=/var/lib/timeserver-monitor/state.json
