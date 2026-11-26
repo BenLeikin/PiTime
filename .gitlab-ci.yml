@@ -4,6 +4,11 @@
 # runner's machine as the gitlab-runner user, with whatever is installed
 # there. It needs python3 (with venv) and git. The JavaScript checks run if
 # node is installed and are skipped with a note if it is not.
+#
+# On Debian and Raspberry Pi OS a new runner fails every job at once with
+# "prepare environment: exit status 1": the gitlab-runner user's
+# ~/.bash_logout tries to clear a console that is not there. Remove or rename
+# that file (sudo mv /home/gitlab-runner/.bash_logout{,.disabled}).
 stages:
   - check
 
