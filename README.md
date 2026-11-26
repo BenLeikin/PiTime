@@ -27,6 +27,7 @@ receiver's PPS pulse, and a web dashboard shows its live state.
 | `etc/sysctl.d/90-timeserver-failover.conf` | `/etc/sysctl.d/` | Only the preferred link answers ARP |
 | `install.sh` | – | Installs on the Pi (run as root) |
 | `deploy.sh` | – | Uploads to the Pi over SSH and runs `install.sh` |
+| `tools/fit_tempcomp.py` | – | Fits chrony `tempcomp` coefficients from the Pi's temperature and frequency logs |
 | `tests/` | – | Parser tests using recorded chronyc/gpsd output |
 
 ## Hardware
