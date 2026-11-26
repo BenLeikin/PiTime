@@ -9,6 +9,7 @@ Usage:
     python3 chrony_dashboard.py [--port 8080] [--bind 0.0.0.0]
 """
 
+import csv
 import subprocess
 import json
 import re
@@ -18,7 +19,9 @@ import os
 import time
 import hashlib
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from html import escape as html_escape
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 
 
@@ -97,11 +100,57 @@ def run(cmd, timeout=5):
         return ""
 
 
+def run_csv(cmd, timeout=5):
+    """Run a chronyc command in CSV mode (-c) and return its rows."""
+    raw = run(cmd, timeout=timeout)
+    return [row for row in csv.reader(raw.splitlines()) if row]
+
+
 def safe_float(s, default=None):
     try:
         return float(s)
     except (ValueError, TypeError):
         return default
+
+
+def safe_int(s, default=None):
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        return default
+
+
+# chronyc reports "never" as an all-ones 32-bit value.
+CHRONY_NEVER = 4294967295
+
+
+def fmt_seconds(x, signed=True):
+    """Format seconds the way chronyc does: +12ns, -9623us, -10ms, 4000ms."""
+    if x is None:
+        return "—"
+    a = abs(x)
+    for scale, unit in ((1e9, "ns"), (1e6, "us"), (1e3, "ms")):
+        if a * scale < 9999.5:
+            v = x * scale
+            break
+    else:
+        v, unit = x, "s"
+    return f"{v:+.0f}{unit}" if signed else f"{abs(v):.0f}{unit}"
+
+
+def fmt_interval(s):
+    """Format a whole-second interval the way chronyc does: 352, 120m, 13h, 4d."""
+    s = safe_int(s)
+    if s is None or s < 0 or s >= CHRONY_NEVER:
+        return "-"
+    if s < 1200:
+        return str(s)
+    if s < 36000:
+        return f"{s // 60}m"
+    if s < 345600:
+        return f"{s // 3600}h"
+    d = s // 86400
+    return f"{d // 365}y" if d > 999 else f"{d}d"
 
 
 def parse_tracking():
@@ -128,75 +177,80 @@ def parse_tracking():
     }
 
 
+SOURCE_STATES = {
+    "*": "synced", "+": "combined", "-": "not combined",
+    "?": "unreachable", "x": "false ticker", "~": "too variable",
+}
+SOURCE_MODES = {"^": "server", "=": "peer", "#": "refclock"}
+
+
 def parse_sources():
-    raw = run(["chronyc", "-n", "sources", "-v"])
+    # CSV columns: mode, state, name, stratum, poll, reach (octal), last rx (s),
+    # adjusted offset (s), measured offset (s), error bound (s).
     sources = []
-    for line in raw.splitlines():
-        m = re.match(
-            r'^([\^=#])([\*\+\-\?xX~])\s+(\S+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)',
-            line.strip()
-        )
-        if m:
-            mode_char = m.group(1)
-            state_char = m.group(2)
-            state_map = {
-                "*": "synced", "+": "combined", "-": "not combined",
-                "?": "unreachable", "x": "false ticker", "~": "too variable",
-            }
-            mode_map = {"^": "server", "=": "peer", "#": "refclock"}
-            sources.append({
-                "mode_char": mode_char,
-                "state_char": state_char,
-                "state":      state_map.get(state_char, state_char),
-                "mode":       mode_map.get(mode_char, "unknown"),
-                "name":       m.group(3),
-                "stratum":    m.group(4),
-                "poll":       m.group(5),
-                "reach":      m.group(6),
-                "last_rx":    m.group(7),
-                "last_sample_offset": m.group(9),
-                "margin":     m.group(10),
-            })
+    for row in run_csv(["chronyc", "-n", "-c", "sources"]):
+        if len(row) < 10:
+            continue
+        mode_char, state_char = row[0], row[1]
+        offset = safe_float(row[7])
+        measured = safe_float(row[8])
+        error = safe_float(row[9])
+        sources.append({
+            "mode_char":  mode_char,
+            "state_char": state_char,
+            "state":      SOURCE_STATES.get(state_char, state_char),
+            "mode":       SOURCE_MODES.get(mode_char, "unknown"),
+            "name":       row[2],
+            "stratum":    row[3],
+            "poll":       row[4],
+            "reach":      row[5],
+            "last_rx":    fmt_interval(row[6]),
+            "last_sample_offset": fmt_seconds(offset),
+            "measured_offset":    fmt_seconds(measured),
+            "margin":     "±" + fmt_seconds(error, signed=False) if error is not None else "—",
+            "offset_s":   offset,
+            "error_s":    error,
+        })
     return sources
 
 
 def parse_sourcestats():
-    raw = run(["chronyc", "-n", "sourcestats"])
+    # CSV columns: name, np, nr, span (s), frequency (ppm), freq skew (ppm),
+    # offset (s), std dev (s).
     stats = []
-    for line in raw.splitlines():
-        m = re.match(
-            r'^(\S+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)',
-            line.strip()
-        )
-        if m and not m.group(1).startswith("=") and m.group(1) != "Name/IP":
-            stats.append({
-                "name":      m.group(1),
-                "np":        m.group(2),
-                "nr":        m.group(3),
-                "span":      m.group(4),
-                "freq":      m.group(5),
-                "freq_skew": m.group(6),
-                "offset":    m.group(7),
-                "std_dev":   m.group(8),
-            })
+    for row in run_csv(["chronyc", "-n", "-c", "sourcestats"]):
+        if len(row) < 8:
+            continue
+        freq = safe_float(row[4])
+        skew = safe_float(row[5])
+        stats.append({
+            "name":      row[0],
+            "np":        row[1],
+            "nr":        row[2],
+            "span":      fmt_interval(row[3]),
+            "freq":      f"{freq:+.3f}" if freq is not None else "—",
+            "freq_skew": f"{skew:.3f}" if skew is not None else "—",
+            "offset":    fmt_seconds(safe_float(row[6])),
+            "std_dev":   fmt_seconds(safe_float(row[7]), signed=False),
+        })
     return stats
 
 
 def parse_clients():
-    raw = run(["chronyc", "-n", "clients"])
+    # CSV columns: host, NTP hits, NTP drops, NTP interval, NTP timeout interval,
+    # NTP last (s ago), cmd hits, cmd drops, cmd interval, cmd last (s ago).
+    # Needs access to chronyd's Unix socket (root or the chrony user).
     clients = []
-    for line in raw.splitlines():
-        if "Hostname" in line or "===" in line or not line.strip():
+    for row in run_csv(["chronyc", "-n", "-c", "clients"]):
+        if len(row) < 6 or not re.match(r'^[\d.:a-fA-F]+$', row[0]):
             continue
-        parts = line.split()
-        if len(parts) >= 6 and re.match(r'^[\d.:a-fA-F]+$', parts[0]):
-            clients.append({
-                "host": parts[0],
-                "ntp": parts[1] if len(parts) > 1 else "0",
-                "drops": parts[2] if len(parts) > 2 else "0",
-                "interval": parts[3] if len(parts) > 3 else "—",
-                "last_query": parts[-1] if len(parts) > 5 else "—",
-            })
+        clients.append({
+            "host":       row[0],
+            "ntp":        row[1],
+            "drops":      row[2],
+            "interval":   row[3],
+            "last_query": fmt_interval(row[5]),
+        })
     return clients
 
 
@@ -228,113 +282,128 @@ def parse_activity():
     return data
 
 
-def parse_pps_history():
-    """Read refclock samples from chrony refclocks.log, fall back to measurements.log."""
-    candidates = [
-        "/var/log/chrony/refclocks.log",
-        "/var/log/chrony/measurements.log",
-    ]
-    for log_path in candidates:
-        if not os.path.exists(log_path):
+REFCLOCKS_LOG = "/var/log/chrony/refclocks.log"
+
+
+def _tail_lines(path, max_bytes=64 * 1024):
+    """Return the last lines of a file without reading all of it."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        data = f.read().decode("utf-8", errors="replace")
+    lines = data.splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]  # first line is probably cut in half
+    return lines
+
+
+def parse_pps_history(refid="PPS", path=REFCLOCKS_LOG, limit=60):
+    """Return the most recent cooked offsets (seconds) for one refclock.
+
+    refclocks.log columns (chrony "log refclocks"):
+      date time refid DP L P raw-offset cooked-offset dispersion
+    """
+    try:
+        lines = _tail_lines(path)
+    except OSError:
+        return []
+    samples = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 9 or parts[2] != refid:
             continue
+        cooked = safe_float(parts[7])
+        if cooked is not None:
+            samples.append(cooked)
+    return samples[-limit:]
+
+
+def _read_gpsd(host="127.0.0.1", port=2947, timeout=3.0):
+    """Return the latest (TPV, SKY) reports from gpsd.
+
+    Sends ?POLL right after ?WATCH so gpsd answers with its cached fix at once
+    instead of us waiting for the next streamed report. Newer gpsd versions also
+    emit SKY reports that carry only DOPs; those are not used for the satellite
+    list, but their DOPs are kept.
+    """
+    tpv = sky = dops = None
+    deadline = time.monotonic() + timeout
+
+    def consider(obj):
+        nonlocal tpv, sky, dops
+        cls = obj.get("class")
+        if cls == "TPV" and obj.get("mode") is not None:
+            tpv = obj
+        elif cls == "SKY":
+            if obj.get("satellites"):
+                sky = obj
+            if any(k in obj for k in ("hdop", "pdop", "vdop")):
+                dops = obj
+        elif cls == "POLL":
+            for t in obj.get("tpv") or []:
+                consider(dict(t, **{"class": "TPV"}))
+            for s in obj.get("sky") or []:
+                consider(dict(s, **{"class": "SKY"}))
+
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.sendall(b'?WATCH={"enable":true,"json":true};\n?POLL;\n')
+        buf = b""
+        while time.monotonic() < deadline and not (tpv and sky):
+            s.settimeout(max(0.05, deadline - time.monotonic()))
+            try:
+                data = s.recv(8192)
+            except socket.timeout:
+                break
+            if not data:
+                break
+            buf += data
+            while b"\n" in buf:
+                line, _, buf = buf.partition(b"\n")
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    consider(json.loads(line))
+                except (json.JSONDecodeError, AttributeError):
+                    continue
         try:
-            result = subprocess.run(
-                ["tail", "-n", "200", log_path],
-                capture_output=True, text=True, timeout=3
-            )
-            samples = []
-            for line in result.stdout.splitlines():
-                if line.startswith("#") or not line.strip():
-                    continue
-                # refclocks.log format: date time refid ... offset ...
-                # We want the offset column (typically column 6 or 7)
-                parts = line.split()
-                if len(parts) < 6:
-                    continue
-                # Try to find a small floating-point offset value
-                for p in parts[3:]:
-                    f = safe_float(p)
-                    if f is not None and abs(f) < 1.0 and abs(f) > 1e-12:
-                        samples.append(f)
-                        break
-            if samples:
-                return samples[-60:]
-        except Exception:
-            continue
-    return []
+            s.sendall(b'?WATCH={"enable":false};\n')
+        except OSError:
+            pass
+    return tpv, sky, dops
 
 
 def get_gpsd_data():
     """Query gpsd directly over TCP. Works regardless of service user."""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3.0)
-        s.connect(("127.0.0.1", 2947))
-        s.sendall(b'?WATCH={"enable":true,"json":true};\n')
-
-        tpv = None
-        sky = None
-        deadline = time.time() + 3.0
-        buf = b''
-        while time.time() < deadline:
-            try:
-                data = s.recv(4096)
-                if not data:
-                    break
-                buf += data
-                while b'\n' in buf:
-                    line, _, buf = buf.partition(b'\n')
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                        cls = obj.get("class")
-                        if cls == "TPV":
-                            tpv = obj
-                        elif cls == "SKY":
-                            sky = obj
-                        if tpv and sky:
-                            break
-                    except json.JSONDecodeError:
-                        continue
-                if tpv and sky:
-                    break
-            except socket.timeout:
-                break
-
-        try:
-            s.sendall(b'?WATCH={"enable":false};\n')
-        except Exception:
-            pass
-        s.close()
+        tpv, sky, dops = _read_gpsd()
 
         sats_used = 0
         sats_visible = 0
         best_snr = 0
         sat_list = []
-        hdop = pdop = vdop = None
 
         if sky:
             satellites = sky.get("satellites", [])
             sats_visible = len(satellites)
             for sat in satellites:
-                used = sat.get("used", False)
+                used = bool(sat.get("used", False))
+                ss = sat.get("ss") or 0
                 if used:
                     sats_used += 1
-                ss = sat.get("ss", 0)
-                if used and ss > best_snr:
-                    best_snr = ss
+                    best_snr = max(best_snr, ss)
                 sat_list.append({
                     "prn": sat.get("PRN", 0),
-                    "el": sat.get("el", 0),
-                    "az": sat.get("az", 0),
+                    "el": sat.get("el"),
+                    "az": sat.get("az"),
                     "ss": ss,
                     "used": used,
                 })
-            hdop = sky.get("hdop")
-            pdop = sky.get("pdop")
-            vdop = sky.get("vdop")
+        dop_src = dops or sky or {}
+        hdop = dop_src.get("hdop")
+        pdop = dop_src.get("pdop")
+        vdop = dop_src.get("vdop")
 
         fix_mode_map = {0: "unknown", 1: "no fix", 2: "2D", 3: "3D"}
         fix_mode = "—"
@@ -345,7 +414,8 @@ def get_gpsd_data():
             fix_time = tpv.get("time")
             lat = tpv.get("lat")
             lon = tpv.get("lon")
-            alt = tpv.get("alt") or tpv.get("altMSL") or tpv.get("altHAE")
+            alt = next((tpv[k] for k in ("altMSL", "alt", "altHAE")
+                        if tpv.get(k) is not None), None)
 
         return {
             "available": True,
@@ -531,7 +601,7 @@ def get_all_data():
     cpu_cores = get_cpu_per_core()
     pps_irq = get_pps_irq_count()
     next_leap = get_next_leap_second()
-    pps_history = parse_pps_history()
+    pps_history = parse_pps_history(CONFIG["pps_refid"])
     system = get_system_info()
     health = compute_health(tracking, sources, gps)
     return {
@@ -548,7 +618,6 @@ def get_all_data():
         "pps_history": pps_history,
         "system":      system,
         "health":      health,
-        "visitors":    get_visitor_stats(),
     }
 
 
@@ -1586,12 +1655,20 @@ let lastFixServerTimeMs = null;
 
 function reachBits(octal) {
   let dec = parseInt(octal, 8);
-  if (isNaN(dec)) return octal;
+  if (isNaN(dec)) return esc(octal);
   let html = '<span class="reach-bits">';
   for (let i = 7; i >= 0; i--) {
     html += `<span class="reach-bit ${(dec >> i) & 1 ? 'on' : 'off'}"></span>`;
   }
   return html + '</span>';
+}
+
+// Escape text before it goes into innerHTML. Everything shown comes from
+// chronyc/gpsd output, but those include names that remote hosts control.
+function esc(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[c]);
 }
 
 function stateClass(state) { return 'state-' + (state || '').replace(/ /g, '-'); }
@@ -1823,7 +1900,7 @@ function drawSparkline(values) {
     text.setAttribute('fill', '#4a6080');
     text.setAttribute('font-family', 'Space Mono');
     text.setAttribute('font-size', '10');
-    text.textContent = 'NO DATA - enable: log measurements in chrony.conf';
+    text.textContent = 'NO DATA - enable: log refclocks in chrony.conf';
     svg.appendChild(text);
     return;
   }
@@ -2116,14 +2193,14 @@ function render(d) {
       const stateCls = isNoselectRefclock ? 'state-noselect' : stateClass(src.state);
       return `
       <tr>
-        <td><span class="state-badge ${stateCls}">${displayState}</span></td>
-        <td>${src.name}</td>
-        <td>${src.stratum}</td>
-        <td>${src.poll}</td>
+        <td><span class="state-badge ${esc(stateCls)}">${esc(displayState)}</span></td>
+        <td>${esc(src.name)}</td>
+        <td>${esc(src.stratum)}</td>
+        <td>${esc(src.poll)}</td>
         <td>${reachBits(src.reach)}</td>
-        <td>${src.last_rx}</td>
-        <td>${src.last_sample_offset}</td>
-        <td>${src.margin}</td>
+        <td>${esc(src.last_rx)}</td>
+        <td>${esc(src.last_sample_offset)}</td>
+        <td>${esc(src.margin)}</td>
       </tr>`;
     }).join('');
   }
@@ -2134,12 +2211,12 @@ function render(d) {
   } else {
     stb.innerHTML = sourcestats.map(r => `
       <tr>
-        <td>${r.name}</td>
-        <td>${r.np} / ${r.nr}</td>
-        <td>${r.span}</td>
-        <td>${r.freq_skew}</td>
-        <td>${r.std_dev}</td>
-        <td>${r.offset}</td>
+        <td>${esc(r.name)}</td>
+        <td>${esc(r.np)} / ${esc(r.nr)}</td>
+        <td>${esc(r.span)}</td>
+        <td>${esc(r.freq_skew)}</td>
+        <td>${esc(r.std_dev)}</td>
+        <td>${esc(r.offset)}</td>
       </tr>`).join('');
   }
 
@@ -2149,10 +2226,10 @@ function render(d) {
   } else {
     cb.innerHTML = clients.map(c => `
       <tr>
-        <td>${c.host}</td>
-        <td>${c.ntp}</td>
-        <td>${c.drops}</td>
-        <td>${c.last_query}</td>
+        <td>${esc(c.host)}</td>
+        <td>${esc(c.ntp)}</td>
+        <td>${esc(c.drops)}</td>
+        <td>${esc(c.last_query)}</td>
       </tr>`).join('');
   }
 
@@ -2164,8 +2241,9 @@ function render(d) {
 
 
 function generateFunFact(d) {
-  const offsetStr = d.tracking.last_offset || '';
-  const m = offsetStr.match(/([-\d.]+)\s*(ns|us|ms|s|seconds)?/);
+  const rawOffset = d.tracking.last_offset || '';
+  const offsetStr = esc(rawOffset);
+  const m = rawOffset.match(/([-\d.]+)\s*(ns|us|ms|s|seconds)?/);
   let ns = 1000;
   if (m) {
     const n = Math.abs(parseFloat(m[1]));
@@ -2192,12 +2270,12 @@ function generateFunFact(d) {
   const visible = d.gps.sats_visible || 0;
   const alt = d.gps.alt;
   const ntpRx = parseInt(d.serverstats.ntp_packets_received) || 0;
-  const uptime = d.system.uptime || '';
-  const stratum = d.tracking.stratum;
+  const uptime = esc(d.system.uptime || '');
+  const stratum = esc(d.tracking.stratum);
   const freq = parseFloat((d.tracking.freq_error || '0').replace(/[^-\d.]/g, '')) || 0;
   const skew = parseFloat((d.tracking.skew || '0').replace(/[^-\d.]/g, '')) || 0;
   const ppsTotal = (d.pps_irq && d.pps_irq.total) || 0;
-  const temp = d.system.temperature || '';
+  const temp = esc(d.system.temperature || '');
   const rootDelay = d.tracking.root_delay || '';
 
   const facts = [
@@ -2540,63 +2618,143 @@ setInterval(fetchData, REFRESH_S * 1000);
 """
 
 
+class StatusCache:
+    """Share one data snapshot between all viewers.
+
+    Collecting a snapshot runs several chronyc commands, samples CPU for 0.2s
+    and talks to gpsd, so it takes a while. Every viewer polls every few
+    seconds; without this, each poll would repeat that work. Concurrent
+    requests that arrive while a refresh is running wait for it and reuse it.
+    """
+
+    def __init__(self, ttl):
+        self.ttl = ttl
+        self._lock = threading.Lock()
+        self._data = None
+        self._stamp = 0.0
+
+    def get(self):
+        with self._lock:
+            if self._data is None or time.monotonic() - self._stamp >= self.ttl:
+                self._data = get_all_data()
+                self._stamp = time.monotonic()
+            data = self._data
+        # Visitor counts are cheap and change per request, so keep them live.
+        return dict(data, visitors=get_visitor_stats())
+
+
+CONFIG = {"pps_refid": "PPS"}
+STATUS_CACHE = StatusCache(ttl=2.0)
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    ),
+}
+
+
 class Handler(BaseHTTPRequestHandler):
+    # Drop idle or slow connections instead of tying up a thread forever.
+    timeout = 15
+    server_version = "chrony-dashboard"
+    sys_version = ""
+
     def log_message(self, fmt, *args):
         pass
 
-    def send_json(self, data):
-        body = json.dumps(data, default=str).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", len(body))
-        self.send_header("Cache-Control", "no-store")
+    def _send(self, status, body, content_type, cache="no-store"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", cache)
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data, default=str).encode()
+        self._send(status, body, "application/json")
 
     def send_html(self, html):
-        body = html.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", len(body))
-        self.end_headers()
-        self.wfile.write(body)
+        self._send(200, html.encode(), "text/html; charset=utf-8")
 
     def do_GET(self):
-        # Record viewer for any real request (HTML or API poll counts as activity)
-        try:
-            ip = self.client_address[0]
-            ua = self.headers.get("User-Agent", "unknown")
-            record_visitor(ip, ua)
-        except Exception:
-            pass
+        path = urlsplit(self.path).path
 
-        if self.path == "/api/status":
+        if path == "/api/status":
+            # Record viewer activity on API polls (the page polls while open).
             try:
-                self.send_json(get_all_data())
+                record_visitor(self.client_address[0],
+                               self.headers.get("User-Agent", "unknown"))
+            except Exception:
+                pass
+            try:
+                self.send_json(STATUS_CACHE.get())
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
-        elif self.path in ("/", "/index.html"):
-            hostname = socket.gethostname()
-            self.send_html(HTML.replace("{hostname}", hostname))
+                print(f"[chrony-dashboard] status error: {e!r}", flush=True)
+                self.send_json({"error": "internal error"}, status=500)
+        elif path == "/api/health":
+            # Small endpoint for monitoring and deploy checks.
+            try:
+                d = STATUS_CACHE.get()
+                self.send_json({"status": d["health"]["status"],
+                                "issues": d["health"]["issues"],
+                                "reference_id": d["tracking"]["reference_id"]})
+            except Exception:
+                self.send_json({"status": "ERROR"}, status=500)
+        elif path in ("/", "/index.html"):
+            try:
+                record_visitor(self.client_address[0],
+                               self.headers.get("User-Agent", "unknown"))
+            except Exception:
+                pass
+            self.send_html(PAGE_HTML)
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._send(404, b"not found\n", "text/plain; charset=utf-8")
+
+    def do_HEAD(self):
+        self.do_GET()
+
+
+class DashboardServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
 
 
 def main():
+    global PAGE_HTML
     parser = argparse.ArgumentParser(description="Chrony GPS Dashboard - Space-Age")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--bind", default="0.0.0.0")
+    parser.add_argument("--pps-refid", default="PPS",
+                        help="refid of the PPS refclock in chrony.conf (default: PPS)")
+    parser.add_argument("--cache-ttl", type=float, default=2.0,
+                        help="seconds to reuse one data snapshot across viewers (default: 2)")
     args = parser.parse_args()
-    server = HTTPServer((args.bind, args.port), Handler)
-    print(f"[chrony-dashboard] Listening on http://{args.bind}:{args.port}")
+    CONFIG["pps_refid"] = args.pps_refid
+    STATUS_CACHE.ttl = args.cache_ttl
+    PAGE_HTML = HTML.replace("{hostname}", html_escape(socket.gethostname()))
+
+    server = DashboardServer((args.bind, args.port), Handler)
+    print(f"[chrony-dashboard] Listening on http://{args.bind}:{args.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[chrony-dashboard] Stopped.")
+
+
+PAGE_HTML = HTML
 
 
 if __name__ == "__main__":
