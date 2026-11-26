@@ -56,7 +56,10 @@ if ! id _chrony >/dev/null 2>&1; then
 fi
 
 # Sanity-check the code before touching the running service.
-python3 -m py_compile "$SRC/dashboard/chrony_dashboard.py"
+# compile() checks syntax without writing a root-owned __pycache__ into the
+# upload folder, which would block the next deploy.
+python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' \
+  "$SRC/dashboard/chrony_dashboard.py"
 
 log "Installing dashboard to $APP_DIR"
 install -d -m 0755 "$APP_DIR"
