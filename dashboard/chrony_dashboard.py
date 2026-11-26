@@ -32,6 +32,9 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, UTC
 
+# Keep in step with the newest entry in CHANGELOG.md (a test checks it).
+__version__ = "2.0.0"
+
 log = logging.getLogger("chrony-dashboard")
 log.addHandler(logging.NullHandler())  # main() sets up real logging
 _warned = {}
@@ -101,6 +104,7 @@ class VisitorLog:
             warn("visitors-save", f"cannot save {self.path}: {e}")
 
     def record(self, ip, ua):
+        """Note one page view or API poll from this address and browser."""
         fp = hashlib.sha256(f"{ip}|{ua[:256]}".encode()).hexdigest()[:16]
         now = time.time()
         with self._lock:
@@ -122,6 +126,7 @@ class VisitorLog:
                 self._last_save = now
 
     def stats(self):
+        """Counts for the page footer: viewing now, and unique visitors ever."""
         cutoff = time.time() - self.active_s
         with self._lock:
             if not self._loaded:
@@ -134,10 +139,12 @@ VISITORS = VisitorLog()
 
 
 def record_visitor(ip, ua):
+    """Record a viewer in the process-wide visitor log."""
     VISITORS.record(ip, ua)
 
 
 def get_visitor_stats():
+    """Current and all-time visitor counts."""
     return VISITORS.stats()
 
 
@@ -233,6 +240,7 @@ def run_csv(cmd, timeout=5):
 
 
 def safe_float(s, default=None):
+    """float(s), or `default` if s is not a number."""
     try:
         return float(s)
     except (ValueError, TypeError):
@@ -240,6 +248,7 @@ def safe_float(s, default=None):
 
 
 def safe_int(s, default=None):
+    """int(s), or `default` if s is not a whole number."""
     try:
         return int(s)
     except (ValueError, TypeError):
@@ -277,27 +286,65 @@ def fmt_interval(s):
     return f"{d // 365}y" if d > 999 else f"{d}d"
 
 
+TRACKING_UNKNOWN = {
+    "reference_id": "—", "stratum": "—", "ref_time": "—", "system_time": "—",
+    "last_offset": "—", "rms_offset": "—", "freq_error": "—", "residual_freq": "—",
+    "skew": "—", "root_delay": "—", "root_dispersion": "—", "update_interval": "—",
+    "leap_status": "—",
+    "ref_time_epoch": None, "system_time_s": None, "last_offset_s": None,
+    "rms_offset_s": None, "frequency_ppm": None, "residual_freq_ppm": None,
+    "skew_ppm": None, "root_delay_s": None, "root_dispersion_s": None,
+    "update_interval_s": None,
+}
+
+
 def parse_tracking():
-    raw = run(["chronyc", "-n", "tracking"])
-    data = {}
-    for line in raw.splitlines():
-        if ":" in line:
-            key, _, val = line.partition(":")
-            data[key.strip()] = val.strip()
+    """chronyd's synchronisation state, from `chronyc tracking`.
+
+    Each value comes back twice: as a number (seconds or ppm) for anything
+    that calculates with it, and worded the way chronyc prints it, which is
+    what the page shows.
+    """
+    # CSV columns: reference id (hex), reference name, stratum, reference time
+    # (epoch), system time offset (s, positive = slow), last offset (s), RMS
+    # offset (s), frequency (ppm, positive = fast), residual frequency (ppm),
+    # skew (ppm), root delay (s), root dispersion (s), update interval (s),
+    # leap status.
+    rows = run_csv(["chronyc", "-n", "-c", "tracking"])
+    if not rows or len(rows[0]) < 14:
+        return dict(TRACKING_UNKNOWN)
+    row = rows[0]
+    numbers = [safe_float(v) for v in row[3:13]]
+    if None in numbers:
+        return dict(TRACKING_UNKNOWN)
+    (ref_time, system_time, last_offset, rms_offset, frequency, residual,
+     skew, root_delay, root_dispersion, interval) = numbers
     return {
-        "reference_id":    data.get("Reference ID", "—"),
-        "stratum":         data.get("Stratum", "—"),
-        "ref_time":        data.get("Ref time (UTC)", "—"),
-        "system_time":     data.get("System time", "—"),
-        "last_offset":     data.get("Last offset", "—"),
-        "rms_offset":      data.get("RMS offset", "—"),
-        "freq_error":      data.get("Frequency", "—"),
-        "residual_freq":   data.get("Residual freq", "—"),
-        "skew":            data.get("Skew", "—"),
-        "root_delay":      data.get("Root delay", "—"),
-        "root_dispersion": data.get("Root dispersion", "—"),
-        "update_interval": data.get("Update interval", "—"),
-        "leap_status":     data.get("Leap status", "—"),
+        "reference_id":    f"{row[0]} ({row[1]})",
+        "stratum":         row[2],
+        "ref_time":        datetime.fromtimestamp(ref_time, tz=UTC).strftime(
+                               "%a %b %d %H:%M:%S %Y"),
+        "system_time":     f"{abs(system_time):.9f} seconds "
+                           f"{'slow' if system_time > 0 else 'fast'} of NTP time",
+        "last_offset":     f"{last_offset:+.9f} seconds",
+        "rms_offset":      f"{rms_offset:.9f} seconds",
+        "freq_error":      f"{abs(frequency):.3f} ppm {'fast' if frequency > 0 else 'slow'}",
+        "residual_freq":   f"{residual:+.3f} ppm",
+        "skew":            f"{skew:.3f} ppm",
+        "root_delay":      f"{root_delay:.9f} seconds",
+        "root_dispersion": f"{root_dispersion:.9f} seconds",
+        "update_interval": f"{interval:.1f} seconds",
+        "leap_status":     row[13],
+        "ref_time_epoch":     ref_time,
+        "system_time_s":      system_time,
+        "last_offset_s":      last_offset,
+        "rms_offset_s":       rms_offset,
+        "frequency_ppm":      frequency,
+        "residual_freq_ppm":  residual,
+        "skew_ppm":           skew,
+        "root_delay_s":       root_delay,
+        "root_dispersion_s":  root_dispersion,
+        "update_interval_s":  interval,
     }
 
 
@@ -321,6 +368,12 @@ def parse_selectdata():
 
 
 def source_state(state_char, reach, select_state=None):
+    """The state name the page shows for one source.
+
+    state_char is chronyc's state symbol, reach its octal reach register,
+    and select_state the letter from `chronyc selectdata` when that is
+    available.
+    """
     if state_char == "?" and reach in ("0", ""):
         # Nothing received in the last 8 polls. Checked first: selectdata still
         # says 'N' for a noselect source that has gone silent.
@@ -334,6 +387,7 @@ def source_state(state_char, reach, select_state=None):
 
 
 def parse_sources():
+    """chronyd's time sources, one dict each, from `chronyc sources`."""
     # CSV columns: mode, state, name, stratum, poll, reach (octal), last rx (s),
     # adjusted offset (s), measured offset (s), error bound (s).
     sources = []
@@ -367,6 +421,7 @@ def parse_sources():
 
 
 def parse_sourcestats():
+    """Drift and offset statistics per source, from `chronyc sourcestats`."""
     # CSV columns: name, np, nr, span (s), frequency (ppm), freq skew (ppm),
     # offset (s), std dev (s).
     stats = []
@@ -389,6 +444,7 @@ def parse_sourcestats():
 
 
 def parse_clients():
+    """The NTP clients chronyd has served, from `chronyc clients`."""
     # CSV columns: host, NTP hits, NTP drops, NTP interval, NTP timeout interval,
     # NTP last (s ago), cmd hits, cmd drops, cmd interval, cmd last (s ago).
     # Needs access to chronyd's Unix socket (root or the chrony user).
@@ -406,32 +462,44 @@ def parse_clients():
     return clients
 
 
+SERVERSTATS_FIELDS = (
+    # Order of `chronyc -c serverstats`. Later chrony versions append more.
+    "ntp_packets_received", "ntp_packets_dropped",
+    "command_packets_received", "command_packets_dropped",
+    "client_log_records",          # client log records dropped
+    "nts_ke_connections_accepted", "nts_ke_connections_dropped",
+    "authenticated_ntp_packets",
+)
+
+
 def parse_serverstats():
-    raw = run(["chronyc", "-n", "serverstats"])
-    data = {}
-    for line in raw.splitlines():
-        if ":" in line:
-            key, _, val = line.partition(":")
-            data[key.strip()] = val.strip()
-    return {
-        "ntp_packets_received": data.get("NTP packets received", "0"),
-        "ntp_packets_dropped":  data.get("NTP packets dropped", "0"),
-        "command_packets_received": data.get("Command packets received", "0"),
-        "command_packets_dropped":  data.get("Command packets dropped", "0"),
-        "client_log_records": data.get("Client log records dropped", "0"),
-    }
+    """Counters of what chronyd has served, from `chronyc serverstats`.
+
+    Needs access to chronyd's Unix socket; without it every counter is "0".
+    """
+    stats = dict.fromkeys(SERVERSTATS_FIELDS, "0")
+    rows = run_csv(["chronyc", "-n", "-c", "serverstats"])
+    if rows and len(rows[0]) >= 5 and all(v.isdigit() for v in rows[0]):
+        stats.update(zip(SERVERSTATS_FIELDS, rows[0], strict=False))
+    return stats
+
+
+ACTIVITY_LABELS = (
+    # Order of `chronyc -c activity`.
+    "sources online", "sources offline",
+    "sources doing burst (return to online)",
+    "sources doing burst (return to offline)",
+    "sources with unknown address",
+)
 
 
 def parse_activity():
-    raw = run(["chronyc", "-n", "activity"])
-    data = {}
-    for line in raw.splitlines():
-        m = re.match(r'^(\d+)\s+(.+)', line.strip())
-        if m:
-            count = m.group(1)
-            label = m.group(2).strip().rstrip('.')
-            data[label] = count
-    return data
+    """How many NTP sources are in each state, from `chronyc activity`."""
+    rows = run_csv(["chronyc", "-n", "-c", "activity"])
+    if not rows or len(rows[0]) < len(ACTIVITY_LABELS) or not all(
+            v.isdigit() for v in rows[0]):
+        return {}
+    return dict(zip(ACTIVITY_LABELS, rows[0], strict=False))
 
 
 REFCLOCKS_LOG = "/var/log/chrony/refclocks.log"
@@ -718,6 +786,7 @@ class CpuSampler:
         self._previous = None  # (monotonic time, {cpu: (idle, total)})
 
     def sample(self):
+        """A list of {"core", "usage"}: the percent each core was busy."""
         try:
             now = time.monotonic()
             previous = self._previous
@@ -747,10 +816,12 @@ CPU_SAMPLER = CpuSampler()
 
 
 def get_cpu_per_core():
+    """Per-core CPU usage since the previous snapshot."""
     return CPU_SAMPLER.sample()
 
 
 def get_pps_irq_count():
+    """How many PPS interrupts the kernel has counted since boot."""
     try:
         with open("/proc/interrupts") as f:
             for line in f:
@@ -765,6 +836,7 @@ def get_pps_irq_count():
 
 
 def get_isolated_cpus():
+    """The CPUs reserved with isolcpus=, as the kernel lists them, or "none"."""
     try:
         with open("/sys/devices/system/cpu/isolated") as f:
             return f.read().strip() or "none"
@@ -772,7 +844,8 @@ def get_isolated_cpus():
         return "—"  # not every kernel exposes this
 
 
-def get_next_leap_second():
+def get_leap_table_expiry():
+    """The date the system's leap-second table expires (YYYY-MM-DD), or None."""
     leap_file = "/usr/share/zoneinfo/leap-seconds.list"
     try:
         if not os.path.exists(leap_file):
@@ -806,6 +879,7 @@ def get_uptime():
 
 
 def get_system_info():
+    """Host facts for the header and the Hardware Vitals panel."""
     hostname = socket.gethostname()
     try:
         # Connecting a UDP socket sends nothing; it only makes the kernel pick
@@ -857,6 +931,12 @@ def get_system_info():
 
 
 def compute_health(tracking, sources, gps):
+    """Overall status and the reasons for it.
+
+    OK: disciplined by GPS as designed. DEGRADED: still serving time, but
+    something is off (no GPS fix, internet time only, a silent source).
+    FAULT: chrony has no synchronised source at all.
+    """
     issues = []
     status = "OK"
     stratum = tracking.get("stratum", "—")
@@ -904,6 +984,7 @@ _COLLECT_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="collect")
 
 
 def get_all_data():
+    """Collect one complete snapshot for /api/status."""
     jobs = {
         "tracking":    parse_tracking,
         "sources":     parse_sources,
@@ -914,7 +995,7 @@ def get_all_data():
         "gps":         get_gpsd_data,
         "cpu_cores":   get_cpu_per_core,
         "pps_irq":     get_pps_irq_count,
-        "next_leap":   get_next_leap_second,
+        "next_leap":   get_leap_table_expiry,
         "pps_history": lambda: parse_pps_history(CONFIG["pps_refid"]),
         "system":      get_system_info,
     }
@@ -940,6 +1021,7 @@ class StatusCache:
         self._stamp = 0.0
 
     def get(self):
+        """The current snapshot, refreshed if older than ttl, with live visitor counts."""
         with self._lock:
             if self._data is None or time.monotonic() - self._stamp >= self.ttl:
                 self._data = get_all_data()
@@ -1018,6 +1100,7 @@ def load_page(hostname=None, tz=None, static_dir=STATIC_DIR):
     html = (html
             .replace("{hostname}", html_escape(hostname or socket.gethostname()))
             .replace("{timezone}", html_escape(tz or detect_timezone(), quote=True))
+            .replace("{version}", __version__)
             .replace("{css_version}", versions["dashboard.css"])
             .replace("{js_version}", versions["dashboard.js"]))
     body = html.encode()
@@ -1025,12 +1108,14 @@ def load_page(hostname=None, tz=None, static_dir=STATIC_DIR):
 
 
 class Handler(BaseHTTPRequestHandler):
+    """Serves the page, its two assets and the JSON API, and nothing else."""
     # Drop idle or slow connections instead of tying up a thread forever.
     timeout = 15
     server_version = "chrony-dashboard"
     sys_version = ""
 
     def log_message(self, fmt, *args):
+        """Drop the default per-request access log."""
         pass
 
     def _send(self, status, body, content_type, cache="no-store", extra=None):
@@ -1047,6 +1132,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def send_json(self, data, status=200):
+        """Send `data` as a JSON response."""
         body = json.dumps(data, default=str).encode()
         self._send(status, body, "application/json")
 
@@ -1066,6 +1152,7 @@ class Handler(BaseHTTPRequestHandler):
             log.exception("could not record visitor")
 
     def do_GET(self):
+        """Route a request: API, page, asset, or 404."""
         url = urlsplit(self.path)
         path = url.path
 
@@ -1090,7 +1177,8 @@ class Handler(BaseHTTPRequestHandler):
                 strict = parse_qs(url.query).get("strict", ["0"])[0] not in ("", "0")
                 self.send_json({"status": d["health"]["status"],
                                 "issues": d["health"]["issues"],
-                                "reference_id": d["tracking"]["reference_id"]},
+                                "reference_id": d["tracking"]["reference_id"],
+                                "version": __version__},
                                status=503 if strict and not healthy else 200)
             except Exception:  # noqa: BLE001 - see above
                 log.exception("could not build the health report")
@@ -1110,16 +1198,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found\n", "text/plain; charset=utf-8")
 
     def do_HEAD(self):
+        """Answer HEAD like GET; _send leaves the body out."""
         self.do_GET()
 
 
 class DashboardServer(ThreadingHTTPServer):
+    """One thread per request; daemon threads, so shutdown never waits on a client."""
     daemon_threads = True
     allow_reuse_address = True
 
 
 def main():
+    """Parse the command line and serve until interrupted."""
     parser = argparse.ArgumentParser(description="Chrony GPS Dashboard - Space-Age")
+    parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--pps-refid", default="PPS",

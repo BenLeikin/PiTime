@@ -180,6 +180,7 @@ sudo password. Config files are backed up on the Pi as
 ```
 python3 chrony_dashboard.py [--port 8080] [--bind 0.0.0.0] [--pps-refid PPS]
                            [--cache-ttl 2] [--trusted-proxy IP]... [--timezone NAME]
+                           [--version]
 ```
 
 The service takes its site options from `DASHBOARD_OPTS` in
@@ -188,7 +189,8 @@ The service takes its site options from `DASHBOARD_OPTS` in
 - `GET /` serves the page; its stylesheet and script are under `/static/`.
 - `GET /api/status` returns the full JSON snapshot. One snapshot is shared by
   all viewers for `--cache-ttl` seconds.
-- `GET /api/health` returns `{"status": "OK"|"DEGRADED"|"FAULT", ...}`. Add
+- `GET /api/health` returns `{"status": "OK"|"DEGRADED"|"FAULT", ...}` with
+  the reasons and the dashboard's version. Add
   `?strict=1` to get HTTP 503 whenever the status is not `OK`, for monitors
   that only look at the status code.
 
@@ -281,6 +283,12 @@ runs the Python tests, the JavaScript tests (`node`), `ruff` and
 same script on every push (`.gitlab-ci.yml`). It is written for a runner with
 the shell executor and installs the two linters into a virtualenv on its
 first run.
+
+## Versions
+
+[CHANGELOG.md](CHANGELOG.md) lists what changed in each version. 1.0.0 is the
+project as first published; 2.0.0 is the merged and reworked one. Upgrading
+an existing 1.0.0 install means following INSTALL.md again.
 
 ## Why I built this
 

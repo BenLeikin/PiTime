@@ -45,6 +45,7 @@ NTP_EPOCH_OFFSET = 2208988800    # seconds between 1900 (NTP) and 1970 (Unix)
 
 
 def load_config(path):
+    """Settings from KEY=VALUE lines in `path`, over the defaults."""
     config = dict(DEFAULTS)
     try:
         with open(path) as f:
@@ -100,6 +101,7 @@ def check_ntp(host, timeout=5):
 
 
 def observe(config):
+    """The server's state right now, as (state, issues)."""
     state, issues = check_health(config["HEALTH_URL"])
     if config["NTP_HOST"]:
         problem = check_ntp(config["NTP_HOST"])
@@ -111,6 +113,7 @@ def observe(config):
 
 
 def span(seconds):
+    """A duration in words: 25 min, 2 h 10 min, 1 d 2 h."""
     seconds = int(seconds)
     days, rest = divmod(seconds, 86400)
     hours, rest = divmod(rest, 3600)
@@ -172,6 +175,7 @@ def decide(previous, state, issues, now, name, threshold, remind_s):
 
 
 def send(webhook_url, message, timeout=10):
+    """POST the message to the webhook; raises OSError if it is not delivered."""
     body = json.dumps({"content": message, "text": message}).encode()
     request = urllib.request.Request(
         webhook_url, data=body,
@@ -182,6 +186,7 @@ def send(webhook_url, message, timeout=10):
 
 
 def load_state(path):
+    """What the previous run stored, or {} if there is nothing usable."""
     try:
         with open(path) as f:
             return json.load(f)
@@ -190,6 +195,7 @@ def load_state(path):
 
 
 def save_state(path, state):
+    """Store the state for the next run, replacing the file in one step."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -198,6 +204,7 @@ def save_state(path, state):
 
 
 def main(argv=None):
+    """Run one check; returns the process exit status."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--config", default="/etc/default/timeserver-monitor")
     parser.add_argument("--test", action="store_true",

@@ -39,6 +39,7 @@ MIN_R2 = 0.5
 
 
 def parse_time(date, clock):
+    """Epoch seconds for a log line's UTC date and time columns."""
     return datetime.strptime(f"{date} {clock}", "%Y-%m-%d %H:%M:%S").replace(
         tzinfo=UTC).timestamp()
 
@@ -135,6 +136,7 @@ def polyfit(xs, ys, degree):
 
 
 def r_squared(xs, ys, coeffs):
+    """(share of the variance in ys the polynomial explains, sd of what is left)."""
     mean = sum(ys) / len(ys)
     total = sum((y - mean) ** 2 for y in ys)
     resid = sum((y - sum(c * x ** i for i, c in enumerate(coeffs))) ** 2
@@ -193,6 +195,7 @@ def fit(temps, freqs):
 
 
 def report(result):
+    """The fit as text for a person to read."""
     r = result
     out = [
         f"Data:        {r['hours']:.1f} h in {r['bins']} five-minute bins",
@@ -216,6 +219,7 @@ def report(result):
 
 
 def fetch(host, name):
+    """Lines of one of the Pi's chrony logs, rotated copies included, over SSH."""
     cmd = ["ssh", "-o", "BatchMode=yes", host,
            f"sudo -n sh -c 'cat {LOG_DIR}/{name}.log*'"]
     return subprocess.run(cmd, capture_output=True, text=True, check=True,
@@ -223,6 +227,7 @@ def fetch(host, name):
 
 
 def read_files(paths):
+    """All lines of the given local log files."""
     lines = []
     for path in paths:
         with open(path, errors="replace") as f:
@@ -231,6 +236,7 @@ def read_files(paths):
 
 
 def main(argv=None):
+    """Fit from the command line; exit status 0 = usable, 1 = problems, 2 = too little data."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--host", help="fetch both logs from this SSH host")
     parser.add_argument("--tempcomp", nargs="+", default=[], help="tempcomp.log files")

@@ -43,6 +43,7 @@ def active_iface():
 
 
 def ipv4_addresses(iface):
+    """The interface's global IPv4 addresses."""
     return [a["local"]
             for link in _ip_json("-4", "addr", "show", "dev", iface)
             for a in link.get("addr_info", [])
@@ -50,6 +51,7 @@ def ipv4_addresses(iface):
 
 
 def gratuitous_arp(iface, ip, count=3, interval=0.5):
+    """Broadcast `count` ARP announcements for `ip` from `iface`."""
     with open(f"/sys/class/net/{iface}/address") as f:
         mac = bytes.fromhex(f.read().strip().replace(":", ""))
     addr = socket.inet_aton(ip)
@@ -66,6 +68,7 @@ def gratuitous_arp(iface, ip, count=3, interval=0.5):
 
 
 def main(argv):
+    """Announce the active interface's addresses after a link event."""
     # A "down" event can arrive after the device is gone, so only "up" events
     # are checked against the hardware list.
     if len(argv) < 3 or argv[2] not in ACTIONS:

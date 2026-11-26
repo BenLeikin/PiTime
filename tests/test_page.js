@@ -58,6 +58,7 @@ function snapshot(overrides = {}) {
       freq_error: '9.797 ppm fast', residual_freq: '+0.000 ppm', skew: '0.007 ppm',
       root_delay: '0.000000001 seconds', root_dispersion: '0.000026874 seconds',
       update_interval: '16.0 seconds', leap_status: 'Normal',
+      last_offset_s: 1.24e-7, rms_offset_s: 2.12e-7, frequency_ppm: 9.797, skew_ppm: 0.007,
     },
     sources: [{ state: 'synced', name: 'PPS', stratum: '0', poll: '4', reach: '377',
                 last_rx: '9', last_sample_offset: '+12ns', margin: '±101ns' }],
@@ -131,6 +132,33 @@ test('usableTimeZone falls back to UTC for unknown zones', () => {
   const { page } = loadPage();
   assert.strictEqual(page.usableTimeZone('Europe/Berlin'), 'Europe/Berlin');
   assert.strictEqual(page.usableTimeZone('Not/AZone'), 'UTC');
+});
+
+test('offsets are coloured by size, from the number the server sends', () => {
+  const { page, elements } = loadPage();
+  const cls = (seconds) => {
+    page.colorizeOffset('text', seconds, 'offset-under-test');
+    return elements['offset-under-test'].className;
+  };
+  assert.strictEqual(cls(1.24e-7), 'stat-val good');     // 124 ns
+  assert.strictEqual(cls(-5e-5), 'stat-val accent');     // 50 us, sign ignored
+  assert.strictEqual(cls(0.002), 'stat-val bad');        // 2 ms
+  assert.strictEqual(elements['offset-under-test'].textContent, 'text');
+});
+
+test('fun facts work from numbers and survive a missing offset', () => {
+  const { page } = loadPage();
+  const withOffset = snapshot();
+  for (let i = 0; i < 200; i++) {
+    const fact = page.generateFunFact(withOffset);
+    assert.ok(!/NaN|undefined|Infinity/.test(fact), fact);
+  }
+  const unknown = snapshot();
+  unknown.tracking = { last_offset: '\u2014', stratum: '\u2014' };   // chrony down
+  for (let i = 0; i < 200; i++) {
+    const fact = page.generateFunFact(unknown);
+    assert.ok(!/NaN|undefined|Infinity/.test(fact), fact);
+  }
 });
 
 test('render fills the tables and escapes what remote hosts control', () => {

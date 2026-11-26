@@ -31,19 +31,16 @@ function setText(id, val) {
   if (el) el.textContent = (val === undefined || val === null || val === '') ? '\u2014' : val;
 }
 
-function colorizeOffset(val, id) {
+// Show an offset as chronyc words it, coloured by its size: under 10 us is
+// good, under 1 ms acceptable, anything more is bad. `seconds` is the number
+// the server sends alongside the text.
+function colorizeOffset(text, seconds, id) {
   const el = document.getElementById(id);
   if (!el) return;
-  el.textContent = val;
-  const m = val && val.match(/([-\d.]+)\s*(ns|us|ms|s|seconds)?/);
-  if (m) {
-    const n = Math.abs(parseFloat(m[1]));
-    const unit = m[2];
-    let ns = n;
-    if (unit === 'us') ns = n * 1000;
-    else if (unit === 'ms') ns = n * 1e6;
-    else if (unit === 's' || unit === 'seconds') ns = n * 1e9;
-    el.className = 'stat-val ' + (ns < 10000 ? 'good' : ns < 1e6 ? 'accent' : 'bad');
+  el.textContent = text;
+  if (typeof seconds === 'number') {
+    const size = Math.abs(seconds);
+    el.className = 'stat-val ' + (size < 1e-5 ? 'good' : size < 1e-3 ? 'accent' : 'bad');
   }
 }
 
@@ -551,7 +548,7 @@ function render(d) {
   tx.textContent = health.status === 'FAULT' ? 'NOT SYNCED' : 'TRANSMITTING';
   tx.classList.toggle('down', health.status === 'FAULT');
 
-  colorizeOffset(t.last_offset, 'h-sys-offset');
+  colorizeOffset(t.last_offset, t.last_offset_s, 'h-sys-offset');
   setText('h-rms-offset', 'RMS ' + t.rms_offset);
   setText('h-stratum', t.stratum);
   setText('h-leap', 'Leap ' + t.leap_status);
@@ -677,19 +674,12 @@ function render(d) {
 
 
 function generateFunFact(d) {
-  const rawOffset = d.tracking.last_offset || '';
-  const offsetStr = esc(rawOffset);
-  const m = rawOffset.match(/([-\d.]+)\s*(ns|us|ms|s|seconds)?/);
-  let ns = 1000;
-  if (m) {
-    const n = Math.abs(parseFloat(m[1]));
-    const unit = m[2];
-    ns = n;
-    if (unit === 'us') ns = n * 1000;
-    else if (unit === 'ms') ns = n * 1e6;
-    else if (unit === 's' || unit === 'seconds') ns = n * 1e9;
-  }
-  const seconds = ns / 1e9;
+  const offsetStr = esc(d.tracking.last_offset || '');
+  // The facts compare the size of the last offset with other things; assume
+  // a microsecond if chrony has not reported one.
+  const seconds = typeof d.tracking.last_offset_s === 'number'
+    ? Math.abs(d.tracking.last_offset_s) : 1e-6;
+  const ns = seconds * 1e9;
   const speedOfLight = 299792458;
   const lightDistance = seconds * speedOfLight;
   const soundSpeed = 343;
@@ -708,8 +698,8 @@ function generateFunFact(d) {
   const ntpRx = parseInt(d.serverstats.ntp_packets_received) || 0;
   const uptime = esc(d.system.uptime || '');
   const stratum = esc(d.tracking.stratum);
-  const freq = parseFloat((d.tracking.freq_error || '0').replace(/[^-\d.]/g, '')) || 0;
-  const skew = parseFloat((d.tracking.skew || '0').replace(/[^-\d.]/g, '')) || 0;
+  const freq = d.tracking.frequency_ppm || 0;
+  const skew = d.tracking.skew_ppm || 0;
   const ppsTotal = (d.pps_irq && d.pps_irq.total) || 0;
   const temp = esc(d.system.temperature || '');
   const rootDelay = d.tracking.root_delay || '';

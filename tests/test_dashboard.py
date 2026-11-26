@@ -95,6 +95,90 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(cd.fmt_interval("-"), "-")
 
 
+# Recorded together on the Pi (chrony 4.3): the CSV row and, below, what
+# `chronyc tracking` printed for it.
+TRACKING_CSV = ("50505300,PPS,1,1795720974.987433748,0.000000199,-0.000000203,0.000023913,"
+                "8.713,-0.004,0.030,0.000000001,0.000007910,32.0,Normal\n")
+TRACKING_TEXT = {
+    "reference_id": "50505300 (PPS)",
+    "stratum": "1",
+    "ref_time": "Thu Nov 26 19:22:54 2026",
+    "system_time": "0.000000199 seconds slow of NTP time",
+    "last_offset": "-0.000000203 seconds",
+    "rms_offset": "0.000023913 seconds",
+    "freq_error": "8.713 ppm fast",
+    "residual_freq": "-0.004 ppm",
+    "skew": "0.030 ppm",
+    "root_delay": "0.000000001 seconds",
+    "root_dispersion": "0.000007910 seconds",
+    "update_interval": "32.0 seconds",
+    "leap_status": "Normal",
+}
+SERVERSTATS_CSV = "50,0,21419,0,0,0,0,11,0,0,0\n"
+ACTIVITY_CSV = "5,0,0,0,6\n"
+
+
+class TrackingTests(unittest.TestCase):
+    def test_csv_is_worded_as_chronyc_words_it(self):
+        with mock.patch.object(cd, "run", fake_run({"tracking": TRACKING_CSV})):
+            tracking = cd.parse_tracking()
+        for key, text in TRACKING_TEXT.items():
+            self.assertEqual(tracking[key], text, key)
+
+    def test_numbers_are_exposed_for_calculation(self):
+        with mock.patch.object(cd, "run", fake_run({"tracking": TRACKING_CSV})):
+            tracking = cd.parse_tracking()
+        self.assertEqual(tracking["last_offset_s"], -2.03e-7)
+        self.assertEqual(tracking["frequency_ppm"], 8.713)
+        self.assertEqual(tracking["skew_ppm"], 0.030)
+        self.assertEqual(tracking["update_interval_s"], 32.0)
+
+    def test_signs(self):
+        row = TRACKING_CSV.replace("0.000000199", "-0.000000199").replace("8.713", "-8.713")
+        with mock.patch.object(cd, "run", fake_run({"tracking": row})):
+            tracking = cd.parse_tracking()
+        self.assertEqual(tracking["system_time"], "0.000000199 seconds fast of NTP time")
+        self.assertEqual(tracking["freq_error"], "8.713 ppm slow")
+
+    def test_chrony_not_running(self):
+        for output in ("", "506 Cannot talk to daemon", "a,b,c"):
+            with mock.patch.object(cd, "run", fake_run({"tracking": output})):
+                tracking = cd.parse_tracking()
+            self.assertEqual(tracking["stratum"], "\u2014", output)
+            self.assertIsNone(tracking["last_offset_s"], output)
+        # Health still reports it rather than failing.
+        self.assertEqual(cd.compute_health(tracking, [], {"available": False})["status"], "FAULT")
+
+
+class ServerStatsAndActivityTests(unittest.TestCase):
+    def test_serverstats(self):
+        with mock.patch.object(cd, "run", fake_run({"serverstats": SERVERSTATS_CSV})):
+            stats = cd.parse_serverstats()
+        self.assertEqual(stats["ntp_packets_received"], "50")
+        self.assertEqual(stats["command_packets_received"], "21419")
+        self.assertEqual(stats["client_log_records"], "0")
+        self.assertEqual(stats["authenticated_ntp_packets"], "11")
+
+    def test_serverstats_not_authorised(self):
+        with mock.patch.object(cd, "run", fake_run({"serverstats": "501 Not authorised"})):
+            stats = cd.parse_serverstats()
+        self.assertEqual(stats["ntp_packets_received"], "0")
+
+    def test_activity_has_no_stray_status_line(self):
+        # The text form starts with "200 OK", which used to be shown as a count.
+        with mock.patch.object(cd, "run", fake_run({"activity": ACTIVITY_CSV})):
+            activity = cd.parse_activity()
+        self.assertEqual(activity, {
+            "sources online": "5", "sources offline": "0",
+            "sources doing burst (return to online)": "0",
+            "sources doing burst (return to offline)": "0",
+            "sources with unknown address": "6"})
+
+    def test_activity_unavailable(self):
+        with mock.patch.object(cd, "run", fake_run({"activity": "506 Cannot talk to daemon"})):
+            self.assertEqual(cd.parse_activity(), {})
+
+
 class ChronycParserTests(unittest.TestCase):
     def test_sources(self):
         with mock.patch.object(cd, "run", fake_run({"sources": SOURCES_CSV})):
@@ -284,6 +368,13 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(a["visitors"]["current"], 1)
         self.assertIsNot(a, b)
+
+
+class VersionTests(unittest.TestCase):
+    def test_version_matches_the_changelog(self):
+        changelog = (ROOT / "CHANGELOG.md").read_text()
+        newest = next(line for line in changelog.splitlines() if line.startswith("## ["))
+        self.assertTrue(newest.startswith(f"## [{cd.__version__}]"), newest)
 
 
 class HealthTests(unittest.TestCase):
@@ -582,7 +673,9 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("test&lt;host&gt;", page)            # hostname is escaped
         self.assertIn('data-timezone="Europe/Berlin"', page)
-        for placeholder in ("{hostname}", "{timezone}", "{css_version}", "{js_version}"):
+        self.assertIn(f"dashboard v{cd.__version__}", page)
+        for placeholder in ("{hostname}", "{timezone}", "{css_version}", "{js_version}",
+                            "{version}"):
             self.assertNotIn(placeholder, page)
         self.assertNotIn("<script>", page)                  # no inline script
         csp = headers["Content-Security-Policy"]

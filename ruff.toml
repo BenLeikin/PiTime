@@ -12,8 +12,9 @@ select = [
     "SIM", "C4",     # needless complexity
     "PLW", "PLE",    # pylint warnings and errors
     "ISC",           # accidental string concatenation
+    "D100", "D101", "D102", "D103",   # every public module, class and function says what it is for
 ]
 
 [lint.per-file-ignores]
 # Tests patch module globals and compare against long recorded lines.
-"tests/*" = ["E501"]
+"tests/*" = ["E501", "D"]
