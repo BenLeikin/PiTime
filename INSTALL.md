@@ -24,21 +24,22 @@ git clone https://github.com/BenLeikin/PiTime.git
 cd PiTime
 ```
 
-### Make the configs yours
+### Make the settings yours
 
-The files under `etc/` are the ones running on my server. Before installing, change:
+Everything that differs from one site to the next is in `site/`. Those files hold my server's values; change them before installing:
 
 | File | What to change |
 |---|---|
-| `etc/chrony/chrony.conf` | `ntsntpserver time.pilg0re.net` to your host name, or remove the whole NTS block if you are not using NTS (without the certificate files chrony logs errors and NTS does not work). `allow all` serves anyone who can reach the Pi; narrow it to your LAN (for example `allow 192.168.0.0/16`) if you want. |
-| `systemd/chrony-webpage.service` | `--trusted-proxy 10.0.0.69` to your reverse proxy's address, or remove the option if there is none. |
-| `boot/firmware/config.txt` | This is a complete Pi 4 file and replaces yours. If you have your own settings, skip it and add the two lines from section 2 by hand. |
+| `site/etc/chrony/conf.d/site.conf` | `allow all` serves anyone who can reach the Pi; narrow it to your LAN if you want (the file shows how). Set `ntsntpserver` to your host name, or remove the NTS block if you are not using NTS (without the certificate files chrony logs errors and NTS does not work). |
+| `site/etc/default/chrony-dashboard` | `--trusted-proxy` is your reverse proxy's address; remove the option if nothing proxies to the dashboard. |
+
+One value outside `site/` belongs to your hardware: the `offset` on the NMEA line in `etc/chrony/chrony.conf`. Section 5 shows how to measure it.
 
 ## 2. Free up the UART
 
 The Pi 4 connects its internal Bluetooth chip to the primary (high-quality) UART by default. We need that UART for the GPS module.
 
-`boot/firmware/config.txt` in this repository already has the lines below under `[all]`; `install.sh --configs` installs it (keeping a backup of yours). To do it by hand instead, edit `/boot/firmware/config.txt` and add:
+`install.sh --configs` adds the lines below to `/boot/firmware/config.txt` if they are missing (keeping a backup) and leaves the rest of your file alone. If your PPS wire is on a different pin, add your own `dtoverlay=pps-gpio,gpiopin=N` line first and the installer will keep it. To do it by hand instead, add under `[all]`:
 
 ```
 enable_uart=1
@@ -73,7 +74,7 @@ sudo ./install.sh --configs
 sudo reboot
 ```
 
-`install.sh --configs` installs chrony's and gpsd's configs, `config.txt`, the dashboard and its service, the failover helpers and the tuning service, and restarts what changed. Every file it replaces is first copied to `<file>.bak-<timestamp>`. The reboot is needed once for the UART and PPS overlays.
+`install.sh --configs` installs chrony's and gpsd's configs and your `site/` settings, adds the boot config lines, and installs the dashboard and its service, the failover helpers and the tuning service. It restarts what changed. Every file it replaces is first copied to `<file>.bak-<timestamp>`. The reboot is needed once for the UART and PPS overlays.
 
 After the reboot, verify:
 
@@ -113,7 +114,7 @@ You should see JSON with TPV (position) and SKY (satellites) data. If no TPV app
 
 ## 5. chrony
 
-`etc/chrony/chrony.conf` is installed by `install.sh --configs`. Key sections:
+`etc/chrony/chrony.conf` is installed by `install.sh --configs`, together with your `site/etc/chrony/conf.d/site.conf`, which it includes. Key sections:
 
 ```
 # GPS time of day from gpsd (NMEA sentences), only used to number the pulses
@@ -128,6 +129,9 @@ pool 2.pool.ntp.org iburst maxsources 3
 
 # One good source is enough, so GPS alone keeps the clock when the internet is down
 minsources 1
+
+# Per-client rate limits, so a public server cannot be abused
+ratelimit interval 1 burst 16 leak 2
 ```
 
 **Use SHM unit 0, not 2.** With `DEVICES="/dev/serial0 /dev/pps0"`, gpsd puts the NMEA time in unit 0. Unit 2 is the `/dev/pps0` pulse with the second taken from the system clock. It shows nanosecond offsets and looks like the better source, but it cannot tell chrony which second it is, so locking PPS to it means the time of day never comes from GPS.
@@ -172,13 +176,17 @@ The `#*` next to PPS means it's selected as the synced source. You're now Stratu
 
 ## 6. The dashboard
 
-Installed by `install.sh` (with or without `--configs`) to `/opt/chrony-dashboard/`, as the service `chrony-webpage`. It runs as chrony's own user, `_chrony`, inside a systemd sandbox; that user can use chronyd's command socket, which the Clients and Server Stats panels need.
+Installed by `install.sh` (with or without `--configs`) to `/opt/chrony-dashboard/`: the server `chrony_dashboard.py` and the page in `static/`. It runs as the service `chrony-webpage`, as chrony's own user `_chrony`, inside a systemd sandbox; that user can use chronyd's command socket, which the Clients and Server Stats panels need. Its options come from `DASHBOARD_OPTS` in `/etc/default/chrony-dashboard`.
 
 Access at `http://<pi-ip>:8080`. `curl -s localhost:8080/api/health` gives a one-line status for monitoring.
 
-To put it behind a reverse proxy (nginx, Caddy, etc.) for HTTPS, point your proxy at `http://<pi-ip>:8080`, have it send `X-Real-IP`, and pass the proxy's address to the dashboard with `--trusted-proxy` in the service unit so visitor counts use the real addresses. The dashboard sets its own security headers (`Content-Security-Policy`, `X-Frame-Options`, ...); if the proxy adds the same ones, hide the dashboard's copies (`proxy_hide_header` in nginx) so each is sent once.
+Viewers on the Pi's own network see everything. Anyone else sees client addresses shortened and no server address or antenna position.
+
+To put it behind a reverse proxy (nginx, Caddy, etc.) for HTTPS, point your proxy at `http://<pi-ip>:8080`, have it send `X-Real-IP`, and give the dashboard the proxy's address with `--trusted-proxy` in `/etc/default/chrony-dashboard`. Without that, everyone coming through the proxy is treated as a public viewer and counted as one visitor. The dashboard sets its own security headers (`Content-Security-Policy`, `X-Frame-Options`, ...); if the proxy adds the same ones, hide the dashboard's copies (`proxy_hide_header` in nginx) so each is sent once.
 
 The PPS jitter chart reads `/var/log/chrony/refclocks.log`, which the repository's `chrony.conf` enables with `log ... refclocks`. Within a few minutes of chrony starting, the chart fills in.
+
+If a panel shows a dash where you expect a value, `journalctl -u chrony-webpage` says what the dashboard could not read.
 
 ## 7. (Optional) PTP master
 
@@ -206,7 +214,7 @@ If you already have a wildcard cert managed elsewhere, see `scripts/sync-nts-cer
 
 If issuing fresh on this server, install acme.sh or certbot and point chrony at the cert files.
 
-The repository's `chrony.conf` has:
+`site/etc/chrony/conf.d/site.conf` has:
 
 ```
 ntsserverkey /etc/chrony/nts/privkey.key
@@ -241,7 +249,22 @@ Check it with `journalctl -u timeserver-tune`. To undo it, `sudo systemctl disab
 
 For temperature compensation, the repository's `chrony.conf` logs the CPU temperature (`tempcomp ... 0 0 0 0`, which applies no correction). After a few days of logging, run `tools/fit_tempcomp.py --host <pi>` from a workstation; it prints the `tempcomp` line to put in `chrony.conf`, or says why there is not enough data yet.
 
-## 11. Updating from a workstation
+## 11. Alerts
+
+A dashboard only helps while someone is looking at it. To be told when the server stops being healthy, run `scripts/health_monitor.py` from cron on a different machine (so it also notices the Pi being down):
+
+```bash
+sudo install -m 755 scripts/health_monitor.py /usr/local/bin/timeserver-monitor
+sudo install -m 600 scripts/timeserver-monitor.conf.example /etc/default/timeserver-monitor
+sudoedit /etc/default/timeserver-monitor       # the Pi's address and your webhook URL
+sudo timeserver-monitor --show                 # what it sees right now
+sudo timeserver-monitor --test                 # sends a test message
+echo '*/5 * * * * root /usr/local/bin/timeserver-monitor' | sudo tee /etc/cron.d/timeserver-monitor
+```
+
+It reports a change once it has lasted three runs (so a restart stays quiet), reports recovery, and repeats a lasting problem once a day.
+
+## 12. Updating from a workstation
 
 Once the Pi is set up, `deploy.sh` pushes changes from a checkout on another machine and runs `install.sh` there:
 

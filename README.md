@@ -20,6 +20,8 @@ https://ntp.pilg0re.net
 - **Temperature compensation** tooling that fits chrony's `tempcomp` from the Pi's own logs
 - **Wired + Wi-Fi failover** on one address, so clients never need reconfiguring
 - **Internet NTP fallback** when GPS signal is lost
+- **Alerting**: a monitor on another machine posts to a webhook when the server turns unhealthy or stops answering
+- **Rate limiting** per client, so a public server cannot be abused or swamped
 - **One-command install and deploy**, with config backups and a health check
 
 ## Performance
@@ -120,17 +122,21 @@ The short version:
 5. (Optional) Enable the PTP master
 6. (Optional) Convert other LAN clients with `scripts/convert-to-chrony.sh`
 
-The configs in `etc/` are the ones running on my server, so they carry my addresses and host names. INSTALL.md lists what to change for yours.
+Everything specific to one site (who may use the server, the NTS host name, the reverse proxy's address) is in `site/`. Those files hold my server's values; INSTALL.md lists what to change for yours.
 
 ## Repository layout
 
 | Path | Installed to | Purpose |
 |---|---|---|
-| `dashboard/chrony_dashboard.py` | `/opt/chrony-dashboard/` | Dashboard server and page |
+| `dashboard/chrony_dashboard.py` | `/opt/chrony-dashboard/` | Dashboard server and data collectors |
+| `dashboard/static/` | `/opt/chrony-dashboard/static/` | The page: `index.html`, `dashboard.css`, `dashboard.js` |
 | `systemd/chrony-webpage.service` | `/etc/systemd/system/` | Dashboard service (runs as `_chrony`, sandboxed) |
-| `etc/chrony/chrony.conf` | `/etc/chrony/` | chrony: PPS + NMEA refclocks, pools, NTS, temperature logging |
+| `site/etc/default/chrony-dashboard` | `/etc/default/` | **Site setting:** dashboard options (reverse proxy address, time zone) |
+| `site/etc/chrony/conf.d/site.conf` | `/etc/chrony/conf.d/` | **Site setting:** who may use the server, NTS certificate and host name |
+| `site/etc/systemd/system/gitlab-runner.service.d/timeserver.conf` | same path under `/` | **Site setting:** low priority for a GitLab CI runner on the Pi (installed only if a runner is) |
+| `etc/chrony/chrony.conf` | `/etc/chrony/` | chrony: PPS + NMEA refclocks, pools, rate limits, temperature logging |
 | `etc/default/gpsd` | `/etc/default/` | gpsd devices and options |
-| `boot/firmware/config.txt` | `/boot/firmware/` | Enables UART, disables Bluetooth, PPS on GPIO 18 |
+| `boot/firmware/config.txt.required` | – | Lines `install.sh` adds to `/boot/firmware/config.txt` if missing (UART, Bluetooth off, PPS on GPIO 18) |
 | `etc/NetworkManager/dispatcher.d/50-link-failover-garp` | `/etc/NetworkManager/dispatcher.d/` | Announces the address when the active link changes |
 | `etc/sysctl.d/90-timeserver-failover.conf` | `/etc/sysctl.d/` | Only the preferred link answers ARP |
 | `usr/local/sbin/timeserver-tune` | `/usr/local/sbin/` | Boot-time low-jitter settings: fixed CPU speed, other interrupts off the PPS CPU, GPS stationary mode |
@@ -139,10 +145,12 @@ The configs in `etc/` are the ones running on my server, so they carry my addres
 | `etc/linuxptp/ptp4l.conf`, `systemd/ptp4l.service` | `/etc/linuxptp/`, `/etc/systemd/system/` | Optional PTP master (copy by hand) |
 | `install.sh` | – | Installs on the Pi (run as root) |
 | `deploy.sh` | – | Uploads to the Pi over SSH and runs `install.sh` |
+| `scripts/health_monitor.py`, `scripts/timeserver-monitor.conf.example` | another machine | Alerts through a webhook when the server is unhealthy or unreachable |
 | `scripts/convert-to-chrony.sh` | – | Points another Linux host at this server |
 | `scripts/sync-nts-cert.sh.example` | – | Pushes a renewed TLS certificate to the Pi for NTS |
 | `tools/fit_tempcomp.py` | – | Fits chrony `tempcomp` coefficients from the Pi's temperature and frequency logs |
-| `tests/` | – | Tests using recorded chronyc/gpsd output and synthetic logs |
+| `tools/check.sh`, `ruff.toml`, `.gitlab-ci.yml` | – | Tests and linters, locally and in CI |
+| `tests/` | – | Python and JavaScript tests using recorded chronyc/gpsd output and synthetic logs |
 
 ## Deploying updates from a workstation
 
@@ -150,7 +158,7 @@ Add an SSH alias for the Pi to `~/.ssh/config`:
 
 ```
 Host timeserver
-    HostName time.pilg0re.net
+    HostName <your-pi-address>
     User <your-pi-user>
 ```
 
@@ -171,33 +179,62 @@ sudo password. Config files are backed up on the Pi as
 
 ```
 python3 chrony_dashboard.py [--port 8080] [--bind 0.0.0.0] [--pps-refid PPS]
-                           [--cache-ttl 2] [--trusted-proxy IP]...
+                           [--cache-ttl 2] [--trusted-proxy IP]... [--timezone NAME]
 ```
 
-Behind a reverse proxy, pass its address with `--trusted-proxy` (set in the
-systemd unit) and have it send `X-Real-IP`. Visitor counts then use the real
-visitor address; the header is ignored from anyone else.
+The service takes its site options from `DASHBOARD_OPTS` in
+`/etc/default/chrony-dashboard`.
 
-- `GET /` serves the dashboard page.
+- `GET /` serves the page; its stylesheet and script are under `/static/`.
 - `GET /api/status` returns the full JSON snapshot. One snapshot is shared by
   all viewers for `--cache-ttl` seconds.
-- `GET /api/health` returns `{"status": "OK"|"DEGRADED"|"FAULT", ...}`, for
-  monitoring.
+- `GET /api/health` returns `{"status": "OK"|"DEGRADED"|"FAULT", ...}`. Add
+  `?strict=1` to get HTTP 503 whenever the status is not `OK`, for monitors
+  that only look at the status code.
 
-The PPS jitter chart reads `/var/log/chrony/refclocks.log`, so
+**Who sees what.** Viewers on the server's own network see everything.
+Everyone else gets a snapshot with client addresses shortened
+(`203.0.113.x`) and without the server's address or the antenna position.
+Behind a reverse proxy, pass its address with `--trusted-proxy` and have it
+send `X-Real-IP`: the dashboard then judges viewers, and counts visitors, by
+the address the proxy reports. A request forwarded by any other proxy is
+treated as public.
+
+Problems reading chrony, gpsd or `/proc` are written to the journal
+(`journalctl -u chrony-webpage`), once and then at most every five minutes
+each. The PPS jitter chart reads `/var/log/chrony/refclocks.log`, so
 `log refclocks` must be enabled in `chrony.conf`. Visitor counts are kept in
 `/var/lib/chrony-dashboard/visitors.json`.
 
+## Monitoring
+
+The dashboard cannot tell you it is down, and nobody watches a dashboard
+around the clock: my GPS antenna once failed and the server ran on internet
+time for a month before I noticed. `scripts/health_monitor.py` closes that
+gap. Run it from cron on **another** machine:
+
+```bash
+sudo install -m 755 scripts/health_monitor.py /usr/local/bin/timeserver-monitor
+sudo install -m 600 scripts/timeserver-monitor.conf.example /etc/default/timeserver-monitor
+sudoedit /etc/default/timeserver-monitor       # addresses and the webhook URL
+sudo timeserver-monitor --test                 # sends a test message
+echo '*/5 * * * * root /usr/local/bin/timeserver-monitor' | sudo tee /etc/cron.d/timeserver-monitor
+```
+
+Every run reads `/api/health` and asks the NTP service itself for the time.
+A change is reported once it has lasted three runs, so restarts stay quiet;
+recovery is reported too, and a lasting problem is repeated daily. The
+webhook can be Discord, Slack, Mattermost or Google Chat.
+
 ## Wired + Wi-Fi failover
 
-The wired (`end0`) and Wi-Fi (`wlan0`) NetworkManager profiles both carry the
-same static address, so DNS, port forwards and clients never change. Route
+The wired and Wi-Fi NetworkManager profiles both carry the same static address, so DNS, port forwards and clients never change. Route
 metrics make the cable preferred whenever it is plugged in:
 
 ```bash
-S="ipv4.method manual ipv4.addresses 10.0.0.16/22 ipv4.gateway 10.0.0.1 ipv4.dns 10.0.0.13 ipv4.dns-search pilg0re.net"
-sudo nmcli con mod "Wired connection 1" $S ipv4.route-metric 100
-sudo nmcli con mod <wifi-profile> $S ipv4.route-metric 600 802-11-wireless.powersave 2
+S="ipv4.method manual ipv4.addresses <address>/<prefix> ipv4.gateway <gateway> ipv4.dns <dns-server>"
+sudo nmcli con mod "<wired-profile>" $S ipv4.route-metric 100
+sudo nmcli con mod "<wifi-profile>" $S ipv4.route-metric 600 802-11-wireless.powersave 2
 ```
 
 `etc/NetworkManager/dispatcher.d/50-link-failover-garp` (installed with
@@ -215,9 +252,9 @@ while the Pi is on Wi-Fi. The Pi's own clock stays PPS-disciplined either way.
 
 - sets the CPU governor to `performance`, so the delay before a pulse is
   timestamped does not change with load;
-- moves every interrupt that can be moved to CPUs 1-2. The PPS pin's
-  interrupt is always serviced on CPU 0 and cannot be moved, so this leaves
-  CPU 0 to it;
+- moves every interrupt that can be moved off CPU 0 (and off any isolated
+  core). The PPS pin's interrupt is always serviced on CPU 0 and cannot be
+  moved, so this leaves CPU 0 to it;
 - puts the u-blox receiver in its stationary model.
 
 On my Pi this roughly halved the spread of PPS offsets.
@@ -236,8 +273,14 @@ yet.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+tools/check.sh
 ```
+
+runs the Python tests, the JavaScript tests (`node`), `ruff` and
+`shellcheck`, skipping any tool that is not installed. GitLab CI runs the
+same script on every push (`.gitlab-ci.yml`). It is written for a runner with
+the shell executor and installs the two linters into a virtualenv on its
+first run.
 
 ## Why I built this
 
