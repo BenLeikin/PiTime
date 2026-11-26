@@ -1,5 +1,19 @@
 #!/bin/bash
-set -e
+# Push a TLS certificate from the host that renews it (for example an nginx
+# reverse proxy running acme.sh) to the time server's chrony, for NTS.
+#
+# Run it from the ACME client after each renewal (acme.sh: --reloadcmd) and
+# also daily from cron, so a push that fails (the time server was offline) is
+# retried the next day:
+#
+#   15 4 * * * /usr/local/bin/sync-nts-cert.sh
+#
+# It does nothing if the time server already has this certificate; --force
+# pushes anyway. Failures are logged under the tag "sync-nts-cert".
+#
+# Copy to /usr/local/bin/sync-nts-cert.sh (mode 700) and edit the settings.
+# The SSH key must be allowed to log in as root on the time server.
+set -euo pipefail
 
 CERT_SRC=/etc/nginx/ssl/example.com.fullchain.crt
 KEY_SRC=/etc/nginx/ssl/example.com.key
@@ -8,13 +22,25 @@ TIME_PORT=22
 SSH_KEY=/root/.ssh/cert_sync
 DEST_DIR=/etc/chrony/nts
 
-SSH_OPTS="-p ${TIME_PORT} -i ${SSH_KEY} -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+trap 'logger -p user.err -t sync-nts-cert "FAILED to sync NTS cert to ${TIME_HOST} (line ${LINENO})"' ERR
 
-ssh ${SSH_OPTS} root@${TIME_HOST} "cat > ${DEST_DIR}/fullchain.crt && chmod 644 ${DEST_DIR}/fullchain.crt && chown _chrony:_chrony ${DEST_DIR}/fullchain.crt" < ${CERT_SRC}
+SSH=(ssh -p "${TIME_PORT}" -i "${SSH_KEY}" -o StrictHostKeyChecking=accept-new
+     -o BatchMode=yes -o ConnectTimeout=15 "root@${TIME_HOST}")
 
-ssh ${SSH_OPTS} root@${TIME_HOST} "cat > ${DEST_DIR}/privkey.key && chmod 600 ${DEST_DIR}/privkey.key && chown _chrony:_chrony ${DEST_DIR}/privkey.key" < ${KEY_SRC}
+local_fp=$(openssl x509 -in "${CERT_SRC}" -noout -fingerprint -sha256)
+remote_fp=$("${SSH[@]}" "openssl x509 -in ${DEST_DIR}/fullchain.crt -noout -fingerprint -sha256 2>/dev/null" || true)
+if [[ "${local_fp}" == "${remote_fp}" && "${1:-}" != "--force" ]]; then
+  exit 0
+fi
 
-ssh ${SSH_OPTS} root@${TIME_HOST} "systemctl reload-or-restart chrony"
+# Write to .new and rename, so chrony never sees a half-written file.
+push() {  # push <source> <dest name> <mode>
+  "${SSH[@]}" "cat > ${DEST_DIR}/$2.new && chmod $3 ${DEST_DIR}/$2.new && chown _chrony:_chrony ${DEST_DIR}/$2.new && mv ${DEST_DIR}/$2.new ${DEST_DIR}/$2" < "$1"
+}
+push "${CERT_SRC}" fullchain.crt 644
+push "${KEY_SRC}" privkey.key 600
 
-logger -t sync-nts-cert "NTS cert synced to ${TIME_HOST} successfully"
+# chrony keeps its NTS server keys in ntsdumpdir, so clients' cookies survive.
+"${SSH[@]}" "systemctl restart chrony"
 
+logger -t sync-nts-cert "NTS cert synced to ${TIME_HOST} ($(openssl x509 -in "${CERT_SRC}" -noout -enddate))"
