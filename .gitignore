@@ -1,4 +1,21 @@
 __pycache__/
 *.pyc
 .venv/
+.env
+*.swp
+
+# Backups made by install.sh and editors
+*.bak
+*.bak[0-9]*
 *.bak-*
+
+# Never commit certificates, keys or chrony's own state
+*.key
+*.crt
+*.pem
+chrony.drift
+chrony.keys
+visitors.json
+
+# Written by the scheduled tempcomp fit
+tempcomp-fit-report.md

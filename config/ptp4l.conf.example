@@ -1,0 +1,30 @@
+[global]
+# Master only, never sync from another PTP source
+slaveOnly               0
+masterOnly              1
+
+# Software timestamping (Pi 4 NIC has no hardware PHC)
+time_stamping           software
+
+# Don't try to discipline system clock; chrony is doing that from GPS
+clock_servo             nullf
+free_running            1
+
+# PTP defaults for LAN
+domainNumber            0
+priority1               128
+priority2               128
+tx_timestamp_timeout    50
+logging_level           6
+
+# Advertise as primary reference (GPS-backed)
+clockClass              6
+clockAccuracy           0x21
+offsetScaledLogVariance 0x4E5D
+timeSource              0x20
+
+# Network transport
+network_transport       UDPv4
+delay_mechanism         E2E
+
+[end0]
