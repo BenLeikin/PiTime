@@ -31,7 +31,7 @@
       <div class="subtitle">GPS-Disciplined NTP Reference</div>
     </div>
     <div class="local-time-block">
-      <div class="lt-label"><span id="lt-name">Server time</span> <span id="lt-zone"></span></div>
+      <div class="lt-label" data-tip-key="Server time"><span id="lt-name">Server time</span> <span id="lt-zone"></span></div>
       <div class="lt-value">
         <span id="lt-hms">--:--:--</span><span class="lt-ms" id="lt-ms">.000</span>
       </div>
@@ -104,7 +104,7 @@
             </span>
           </div>
           <canvas id="skyview-canvas" role="img" aria-label="Sky view of the satellites the GPS receiver sees"></canvas>
-          <div class="sat-bars-head">Signal strength (dB-Hz) <span class="sat-bars-key">&mdash; 35+ good, 25 marginal</span></div>
+          <div class="sat-bars-head"><span data-tip-key="Signal strength">Signal strength (dB-Hz)</span> <span class="sat-bars-key">&mdash; 35+ good, 25 marginal</span></div>
           <div class="sat-bars" id="sat-bars" role="img" aria-label="Signal strength of each satellite"></div>
         </div>
         <div class="card">

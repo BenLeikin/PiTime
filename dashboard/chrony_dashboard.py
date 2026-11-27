@@ -36,7 +36,7 @@ from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, UTC
 
 # Keep in step with the newest entry in CHANGELOG.md (a test checks it).
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
 log = logging.getLogger("chrony-dashboard")
 log.addHandler(logging.NullHandler())  # main() sets up real logging

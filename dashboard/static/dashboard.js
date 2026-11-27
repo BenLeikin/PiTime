@@ -1532,11 +1532,23 @@ function startProgress() {
 // ============================================================================
 const GLOSSARY = {
   // Header meta
-  'Node': 'The IP address this server is reachable at on the local network. Clients use this address to query for time.',
-  'Uptime': 'How long the Pi has been running since it last booted.',
-  'Core Temp': 'Temperature of the CPU. Affects the local oscillator frequency. Stable temperatures yield more stable clocks.',
-  'Mission Time': 'The server\'s UTC time when the data on this page was collected (refreshed every few seconds).',
   'Status': 'TRANSMITTING means chrony has a synchronised source and is serving time. NOT SYNCED means it has none. NO LINK means this page cannot reach the dashboard server, so everything shown is old.',
+  // Status tiles
+  'Server Offset': 'The last correction chrony made to the server\'s clock against its reference (GPS while it is locked). RMS below it is the typical size of recent corrections. Under 10 µs is excellent.',
+  'Error Bound': 'The most the server\'s clock could be off, by chrony\'s own accounting: the error built up since its reference (root dispersion) plus half the round trip to that reference (root delay). Microseconds on GPS; milliseconds on internet time.',
+  'On GPS (24 h)': 'Share of the last 24 hours the server was disciplined by GPS (stratum 1), from the history recorded each minute, with the number of outages and the longest. Minutes when nothing was recorded count neither way.',
+  'Your Clock': 'How far your device\'s clock is from this server\'s, measured by your browser over the network: the server\'s time is read several times and the reading with the shortest round trip is kept. Differences under 20 ms are within what a browser can measure.',
+
+  // GPS
+  'Satellites Now': 'The satellites the receiver lists right now, placed where they are in the sky: the centre is straight up, the outer ring is the horizon, north is at the top. Green ones are used for the position and time fix.',
+  'Signal strength': 'Signal strength of each satellite in dB-Hz, labelled with its number. Above about 35 is good, around 25 is marginal, below 20 is usually too weak to use. Green bars are satellites in the fix.',
+  'Sky Visibility (last weeks)': 'Where in the sky satellites are heard, built up over days: each minute every satellite the receiver lists is counted in a 10° patch of sky. Green: heard well. Amber: heard weakly. Red: satellites pass but are almost never heard, so something blocks the antenna\'s view. Grey: not enough passes yet. Older counts fade by half each week.',
+
+  // Network and details
+  'Agreement': 'Where each source puts the time compared with this server\'s clock: the dot is its offset, the line its error margin. The scale is even in powers of ten (centre 0, halfway out 10 µs, edge 100 ms) so nanoseconds and milliseconds fit on one bar. Green under 10 µs, cyan under 1 ms, red above.',
+  'Skew': 'How uncertain chrony\'s estimate of the crystal\'s rate error is, in ppm. Small means chrony knows the rate well; it grows after a restart or when the reference changes.',
+  'Data Collected': 'When the server collected the data shown on this page (UTC). It refreshes every few seconds.',
+
   'Server time': 'The server\'s own clock, measured from your browser: a few quick requests, keeping the one with the shortest round trip, as an NTP client would. The line below compares it with your device\'s clock.',
 
   // GPS Subsystem
@@ -1549,11 +1561,7 @@ const GLOSSARY = {
   'Time Since Lock': 'How long the receiver has held a fix without a break, as tracked by this dashboard (checked every 10 seconds). A leading ">" means the fix was already there when the dashboard started, so the true figure is longer.',
 
   // Offset / Stratum / Frequency
-  'System Offset': 'The last correction chrony made to the server\'s clock against its reference. Smaller is better; under 10 \u00b5s is excellent.',
-  'Last Offset': 'The correction chrony made to the server\'s clock at its last update, against GPS.',
-  'Stratum Level': 'Your position in the NTP hierarchy. Stratum 0 is the reference clock itself (GPS, atomic). Stratum 1 reads directly from it. Each downstream layer adds 1.',
   'NTP Stratum': 'Stratum number assigned to packets your server sends out. Lower means closer to the time source. 1 is the lowest a server can advertise.',
-  'Frequency Drift': 'How far the Pi\'s own crystal runs from the true rate, in parts per million (1 ppm = 86.4 ms a day). chrony measures it against GPS and cancels it continuously.',
   'Crystal Rate Error': 'How fast or slow the Pi\'s own crystal runs, in parts per million, before correction. A few ppm is normal: chrony measures it against GPS and cancels it, so the served time is not affected.',
 
   // PPS card
@@ -1679,11 +1687,15 @@ function _hideTip() {
 function attachTooltips(root) {
   root = root || document;
   // Selectors covering every kind of label that should be hoverable
-  const selectors = ['.stat-key', '.card-title', '.header-meta dt', 'th', '.hero-stat .lbl', '.history-title'];
+  const selectors = ['.stat-key', '.card-title', '.header-meta dt', 'th', '.hero-stat .lbl',
+                     '.history-title', '.tile-label', '.skyview-header .title', '[data-tip-key]'];
   const nodes = root.querySelectorAll(selectors.join(','));
   nodes.forEach(el => {
     if (el.dataset.tipBound) return;
-    const text = (el.textContent || '').trim();
+    // An element can name its explanation (data-tip-key) when its text
+    // changes or carries extra words; otherwise its text is the key, without
+    // any leading symbol such as the \u25BA marker.
+    const text = el.dataset.tipKey || (el.textContent || '').trim().replace(/^[^A-Za-z0-9]+/, '');
     if (!text) return;
     const def = GLOSSARY[text];
     if (!def) return;

@@ -2,6 +2,13 @@
 
 Notable changes to this project. Versions follow [semantic versioning](https://semver.org/): the major number changes when an upgrade needs action on an existing install.
 
+## [2.4.1] - 2026-11-26
+
+### Added
+
+- Explanations (the "?" tips) for everything new in 2.4.0: the five status tiles, the live satellite view, the signal bars, the sky visibility map, the Agreement column, Skew and Data Collected, and the server clock in the header. Explanations for labels that no longer exist are removed.
+- A test that every label on the page has an explanation and every explanation has a label.
+
 ## [2.4.0] - 2026-11-26
 
 ### Added
