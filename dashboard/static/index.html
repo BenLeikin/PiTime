@@ -3,17 +3,19 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark light">
 <title>Time Server</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="icon" id="favicon" href="data:,">
+<link rel="preload" href="/static/fonts/space-mono-400-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/orbitron-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/static/dashboard.css?v={css_version}">
 </head>
-<body data-timezone="{timezone}">
+<body data-timezone="{timezone}" class="loading">
+<a class="skip-link" href="#dashboard">Skip to the status</a>
 <div class="wrap">
 
   <header>
-    <div class="mission-patch">
+    <div class="mission-patch" aria-hidden="true">
       <svg viewBox="0 0 40 40">
         <circle cx="20" cy="20" r="16"/>
         <circle cx="20" cy="20" r="3" class="filled"/>
@@ -37,248 +39,271 @@
       <div class="lt-device" id="lt-device">checking your clock&hellip;</div>
     </div>
     <dl class="header-meta">
-      <dt>Node</dt><dd id="h-ip">—</dd>
       <dt>Link</dt><dd id="h-link">—</dd>
-      <dt>Uptime</dt><dd id="h-uptime">—</dd>
-      <dt>Core Temp</dt><dd id="h-temp">—</dd>
-      <dt>Mission Time</dt><dd id="h-ts" style="font-size: 0.65rem">—</dd>
       <dt>Status</dt><dd><span class="tx-indicator" id="tx-indicator">CHECKING</span></dd>
     </dl>
   </header>
 
   <div id="refresh-bar"><div id="refresh-progress"></div></div>
 
-  <div id="loading">&#9658; ESTABLISHING TELEMETRY LINK</div>
+  <main id="dashboard" tabindex="-1">
 
-  <div id="dashboard">
+    <section aria-labelledby="sec-status">
+      <h2 class="section-heading" id="sec-status"><span class="marker" aria-hidden="true">&#9658;</span><span>Status</span></h2>
 
-    <div class="banner ok" id="status-banner">
-      <span id="status-text">CHECKING...</span>
-      <span class="issues" id="status-issues"></span>
-    </div>
+      <div class="banner ok" id="status-banner" role="status" aria-live="polite">
+        <span id="status-text">CHECKING</span>
+        <span class="issues" id="status-issues"></span>
+      </div>
 
-    <div class="banner holdover" id="holdover-banner" hidden>
-      <span id="holdover-text"></span>
-      <span class="issues" id="holdover-detail"></span>
-    </div>
+      <div class="banner holdover" id="holdover-banner" role="alert" hidden>
+        <span id="holdover-text"></span>
+        <span class="issues" id="holdover-detail"></span>
+      </div>
+
+      <div class="summary-tiles">
+        <div class="tile">
+          <div class="tile-label">Server Offset</div>
+          <div class="tile-val" id="h-sys-offset">—</div>
+          <div class="tile-sub" id="h-rms-offset">RMS —</div>
+        </div>
+        <div class="tile">
+          <div class="tile-label">Error Bound</div>
+          <div class="tile-val" id="sum-bound">—</div>
+          <div class="tile-sub">most the clock could be off</div>
+        </div>
+        <div class="tile">
+          <div class="tile-label">NTP Stratum</div>
+          <div class="tile-val" id="h-stratum">—</div>
+          <div class="tile-sub" id="h-leap">Leap —</div>
+        </div>
+        <div class="tile">
+          <div class="tile-label">On GPS (24 h)</div>
+          <div class="tile-val" id="sum-ongps">—</div>
+          <div class="tile-sub" id="sum-outages">—</div>
+        </div>
+        <div class="tile">
+          <div class="tile-label">Your Clock</div>
+          <div class="tile-val" id="sum-device">—</div>
+          <div class="tile-sub" id="sum-device-sub">compared with this server</div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="sec-gps">
+      <h2 class="section-heading" id="sec-gps"><span class="marker" aria-hidden="true">&#9658;</span><span>GPS</span></h2>
+
+      <div class="grid-2">
+        <div class="skyview-card">
+          <div class="skyview-header">
+            <span class="title">&#9658; Satellites Now</span>
+            <span class="legend">
+              <span class="dot used"></span>Used
+              <span class="dot visible"></span>Visible
+              <span id="skyview-meta" class="skyview-meta">—</span>
+            </span>
+          </div>
+          <canvas id="skyview-canvas" role="img" aria-label="Sky view of the satellites the GPS receiver sees"></canvas>
+          <div class="sat-bars-head">Signal strength (dB-Hz) <span class="sat-bars-key">&mdash; 35+ good, 25 marginal</span></div>
+          <div class="sat-bars" id="sat-bars" role="img" aria-label="Signal strength of each satellite"></div>
+        </div>
+        <div class="card">
+          <div class="card-title">GPS Subsystem</div>
+          <div class="stat-row"><span class="stat-key">Fix Mode</span><span class="stat-val" id="g-fix">—</span></div>
+          <div class="stat-row"><span class="stat-key">Satellites Locked / Visible</span><span class="stat-val" id="g-sats">—</span></div>
+          <div class="stat-row"><span class="stat-key">Best SNR (dB-Hz)</span><span class="stat-val" id="g-snr">—</span></div>
+          <div class="stat-row"><span class="stat-key">HDOP</span><span class="stat-val" id="g-hdop">—</span></div>
+          <div class="stat-row"><span class="stat-key">PDOP</span><span class="stat-val" id="g-pdop">—</span></div>
+          <div class="stat-row"><span class="stat-key">Altitude</span><span class="stat-val" id="g-alt">—</span></div>
+          <div class="stat-row"><span class="stat-key">Time Since Lock</span><span class="stat-val" id="g-fix-age">—</span></div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">PPS Discipline (recent samples)</div>
+          <svg class="sparkline" id="pps-spark" preserveAspectRatio="none" role="img" aria-label="Recent PPS offsets"></svg>
+          <div class="stat-row"><span class="stat-key">Min</span><span class="stat-val" id="pps-min">—</span></div>
+          <div class="stat-row"><span class="stat-key">Max</span><span class="stat-val" id="pps-max">—</span></div>
+          <div class="stat-row"><span class="stat-key">Range</span><span class="stat-val" id="pps-range">—</span></div>
+          <div class="stat-row"><span class="stat-key">Sample count</span><span class="stat-val" id="pps-count">—</span></div>
+          <div class="stat-row"><span class="stat-key">PPS IRQ Total</span><span class="stat-val" id="pps-irq">—</span></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Sky Visibility (last weeks)</div>
+          <canvas id="skymap-canvas" class="skymap-canvas" role="img" aria-label="Where in the sky satellites are heard and where they are blocked"></canvas>
+          <div class="history-legend" id="skymap-legend"></div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="sec-history">
+      <h2 class="section-heading" id="sec-history"><span class="marker" aria-hidden="true">&#9658;</span><span>History</span></h2>
+
+      <div class="card full">
+        <div class="history-head">
+          <div class="card-title">History</div>
+          <div class="range-buttons" id="history-range" role="group" aria-label="History range">
+            <button type="button" data-range="6h">6 h</button>
+            <button type="button" data-range="24h" class="active" aria-pressed="true">24 h</button>
+            <button type="button" data-range="7d">7 d</button>
+            <button type="button" data-range="30d">30 d</button>
+          </div>
+        </div>
+        <div class="history-summary" id="hist-summary">&mdash;</div>
+        <div class="history-grid">
+          <div class="history-panel">
+            <div class="history-title">Clock offset</div>
+            <div class="chart-box"><svg class="history-chart" id="hist-offset" preserveAspectRatio="none" role="img"></svg></div>
+            <div class="history-legend" id="hist-offset-legend"></div>
+          </div>
+          <div class="history-panel">
+            <div class="history-title">Frequency and temperature</div>
+            <div class="chart-box"><svg class="history-chart" id="hist-freq" preserveAspectRatio="none" role="img"></svg></div>
+            <div class="history-legend" id="hist-freq-legend"></div>
+          </div>
+          <div class="history-panel">
+            <div class="history-title">GPS reception</div>
+            <div class="chart-box"><svg class="history-chart" id="hist-gps" preserveAspectRatio="none" role="img"></svg></div>
+            <div class="history-legend" id="hist-gps-legend"></div>
+          </div>
+          <div class="history-panel">
+            <div class="history-title">Client traffic</div>
+            <div class="chart-box"><svg class="history-chart" id="hist-traffic" preserveAspectRatio="none" role="img"></svg></div>
+            <div class="history-legend" id="hist-traffic-legend"></div>
+          </div>
+          <div class="history-panel">
+            <div class="history-title">Crystal ageing (last 30 days)</div>
+            <div class="chart-box"><svg class="history-chart" id="hist-ageing" preserveAspectRatio="none" role="img"></svg></div>
+            <div class="history-legend" id="hist-ageing-legend"></div>
+          </div>
+          <div class="history-panel">
+            <div class="history-title">Health</div>
+            <div class="chart-box"><svg class="history-band" id="hist-health" preserveAspectRatio="none" role="img"></svg></div>
+            <div class="history-legend" id="hist-health-legend"></div>
+          </div>
+        </div>
+        <div class="history-axis" id="hist-axis"></div>
+        <div class="history-note" id="hist-note"></div>
+      </div>
+    </section>
+
+    <section aria-labelledby="sec-network">
+      <h2 class="section-heading" id="sec-network"><span class="marker" aria-hidden="true">&#9658;</span><span>Network</span></h2>
+
+      <div class="card full">
+        <div class="card-title">Time Sources</div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr>
+              <th>State</th><th>Source</th><th>Stratum</th><th>Poll</th>
+              <th>Reach</th><th>Last Rx</th><th>Offset</th><th>Margin</th><th>Agreement</th>
+            </tr></thead>
+            <tbody id="sources-body"><tr><td colspan="9" class="empty">Loading&hellip;</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card full">
+        <div class="card-title">Connected Clients</div>
+        <div class="clients-summary" id="clients-summary">&mdash;</div>
+        <details class="collapsible" id="clients-details">
+          <summary>All clients</summary>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>Client</th><th>NTP Requests</th><th>Drops</th><th>Last Query</th></tr></thead>
+              <tbody id="clients-body"><tr><td colspan="4" class="empty">Loading&hellip;</td></tr></tbody>
+            </table>
+          </div>
+        </details>
+        <div id="clients-note" class="note" hidden>Addresses are shortened for viewers outside the server's own network.</div>
+      </div>
+
+      <div class="card full">
+        <div class="card-title">This Server's Time Around the World</div>
+        <div class="world-clock" id="world-clock">—</div>
+      </div>
+    </section>
+
+    <details class="collapsible section-details" id="system-details">
+      <summary class="section-heading"><span class="marker" aria-hidden="true">&#9658;</span><span>System Details</span></summary>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Tracking Detail</div>
+          <div class="stat-row"><span class="stat-key">Reference ID</span><span class="stat-val" id="t-refid">—</span></div>
+          <div class="stat-row"><span class="stat-key">Ref Time (UTC)</span><span class="stat-val" id="t-reftime">—</span></div>
+          <div class="stat-row"><span class="stat-key">Update Interval</span><span class="stat-val" id="t-interval">—</span></div>
+          <div class="stat-row"><span class="stat-key">Root Delay</span><span class="stat-val" id="t-rootdelay">—</span></div>
+          <div class="stat-row"><span class="stat-key">Root Dispersion</span><span class="stat-val" id="t-rootdisp">—</span></div>
+          <div class="stat-row"><span class="stat-key">Crystal Rate Error</span><span class="stat-val" id="h-freq">—</span></div>
+          <div class="stat-row"><span class="stat-key">Skew</span><span class="stat-val" id="h-skew">—</span></div>
+          <div class="stat-row"><span class="stat-key">Residual Freq</span><span class="stat-val" id="t-residfreq">—</span></div>
+          <div class="stat-row"><span class="stat-key">Activity</span><span class="stat-val" id="t-activity">—</span></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Hardware Vitals</div>
+          <div class="stat-row"><span class="stat-key">Hostname</span><span class="stat-val" id="s-host">—</span></div>
+          <div class="stat-row"><span class="stat-key">IP Address</span><span class="stat-val" id="s-ip">—</span></div>
+          <div class="stat-row"><span class="stat-key">Core Temperature</span><span class="stat-val" id="s-temp">—</span></div>
+          <div class="stat-row"><span class="stat-key">Memory</span><span class="stat-val" id="s-mem">—</span></div>
+          <div class="stat-row"><span class="stat-key">Load Average</span><span class="stat-val" id="s-load">—</span></div>
+          <div class="stat-row"><span class="stat-key">System Uptime</span><span class="stat-val" id="s-uptime">—</span></div>
+          <div class="stat-row"><span class="stat-key">Isolated Cores</span><span class="stat-val" id="s-isolated">—</span></div>
+          <div class="stat-row"><span class="stat-key">Leap Data Expiry</span><span class="stat-val" id="s-leap">—</span></div>
+          <div class="stat-row"><span class="stat-key">NTS Certificate</span><span class="stat-val" id="s-cert">—</span></div>
+          <div class="stat-row"><span class="stat-key">Data Collected</span><span class="stat-val" id="h-ts">—</span></div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">CPU Core Utilization</div>
+          <div id="cpu-cores">—</div>
+        </div>
+        <div class="card">
+          <div class="card-title">NTP Service Statistics</div>
+          <div class="stat-row"><span class="stat-key">NTP Packets Received</span><span class="stat-val" id="ss-rx">—</span></div>
+          <div class="stat-row"><span class="stat-key">NTP Packets Dropped</span><span class="stat-val" id="ss-drop">—</span></div>
+          <div class="stat-row"><span class="stat-key">Command Packets Received</span><span class="stat-val" id="ss-cmd-rx">—</span></div>
+          <div class="stat-row"><span class="stat-key">Command Packets Dropped</span><span class="stat-val" id="ss-cmd-drop">—</span></div>
+          <div class="stat-row"><span class="stat-key">Client Log Records Dropped</span><span class="stat-val" id="ss-clog">—</span></div>
+        </div>
+      </div>
+
+      <div class="card full">
+        <div class="card-title">Source Statistics</div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr>
+              <th>Source</th><th>Samples (NP/NR)</th><th>Span</th>
+              <th>Freq Skew</th><th>Std Dev</th><th>Offset</th>
+            </tr></thead>
+            <tbody id="stats-body"><tr><td colspan="6" class="empty">Loading&hellip;</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </details>
 
     <div class="fun-fact" id="fun-fact">
       <span class="label">DID YOU KNOW</span>
-      <span class="text" id="fun-fact-text">Computing telemetry...</span>
+      <span class="text" id="fun-fact-text">&hellip;</span>
     </div>
 
-    <div class="section-heading"><span class="marker">&#9658;</span><span>Orbital Tracking</span></div>
-
-    <div class="grid-2">
-      <div class="skyview-card" style="margin-bottom:0">
-        <div class="skyview-header">
-          <span class="title">&#9658; GPS Constellation View</span>
-          <span class="legend">
-            <span class="dot used"></span>Locked
-            <span class="dot visible"></span>Visible
-            <span id="skyview-meta" style="margin-left:1.2rem; color: var(--amber);">—</span>
-          </span>
-        </div>
-        <canvas id="skyview-canvas"></canvas>
-      </div>
-      <div class="card">
-        <div class="card-title">GPS Subsystem</div>
-        <div class="stat-row"><span class="stat-key">Fix Mode</span><span class="stat-val accent" id="g-fix">—</span></div>
-        <div class="stat-row"><span class="stat-key">Satellites Locked / Visible</span><span class="stat-val" id="g-sats">—</span></div>
-        <div class="stat-row"><span class="stat-key">Best SNR (dB-Hz)</span><span class="stat-val" id="g-snr">—</span></div>
-        <div class="stat-row"><span class="stat-key">HDOP</span><span class="stat-val" id="g-hdop">—</span></div>
-        <div class="stat-row"><span class="stat-key">PDOP</span><span class="stat-val" id="g-pdop">—</span></div>
-        <div class="stat-row"><span class="stat-key">Altitude</span><span class="stat-val" id="g-alt">—</span></div>
-        <div class="stat-row"><span class="stat-key">Time Since Lock</span><span class="stat-val good" id="g-fix-age">—</span></div>
-      </div>
-    </div>
-
-    <div class="section-heading"><span class="marker">&#9658;</span><span>Primary Telemetry</span></div>
-
-    <div class="grid-3">
-      <div class="card">
-        <div class="card-title">System Offset</div>
-        <div class="hero-stat">
-          <div class="val" id="h-sys-offset">—</div>
-          <div class="lbl">Last Offset</div>
-          <div class="sub" id="h-rms-offset">RMS —</div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-title">Stratum Level</div>
-        <div class="hero-stat">
-          <div class="val" id="h-stratum">—</div>
-          <div class="lbl">NTP Stratum</div>
-          <div class="sub" id="h-leap">Leap —</div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-title">Frequency Drift</div>
-        <div class="hero-stat">
-          <div class="val neutral" id="h-freq">—</div>
-          <div class="lbl">Crystal Rate Error</div>
-          <div class="sub" id="h-skew">Skew —</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="card full">
-        <div class="card-title">PPS Discipline (recent samples)</div>
-        <svg class="sparkline" id="pps-spark" preserveAspectRatio="none"></svg>
-        <div class="stat-row" style="margin-top:0.7rem"><span class="stat-key">Min</span><span class="stat-val good" id="pps-min">—</span></div>
-        <div class="stat-row"><span class="stat-key">Max</span><span class="stat-val warn" id="pps-max">—</span></div>
-        <div class="stat-row"><span class="stat-key">Range</span><span class="stat-val accent" id="pps-range">—</span></div>
-        <div class="stat-row"><span class="stat-key">Sample count</span><span class="stat-val" id="pps-count">—</span></div>
-        <div class="stat-row"><span class="stat-key">PPS IRQ Total</span><span class="stat-val amber" id="pps-irq">—</span></div>
-      </div>
-
-    <div class="section-heading"><span class="marker">&#9658;</span><span>History</span></div>
-
-    <div class="card full">
-      <div class="history-head">
-        <div class="card-title">History</div>
-        <div class="range-buttons" id="history-range">
-          <button type="button" data-range="6h">6 h</button>
-          <button type="button" data-range="24h" class="active">24 h</button>
-          <button type="button" data-range="7d">7 d</button>
-          <button type="button" data-range="30d">30 d</button>
-        </div>
-      </div>
-      <div class="history-summary" id="hist-summary">&mdash;</div>
-      <div class="history-grid">
-        <div class="history-panel">
-          <div class="history-title">Clock offset</div>
-          <svg class="history-chart" id="hist-offset" preserveAspectRatio="none"></svg>
-          <div class="history-legend" id="hist-offset-legend"></div>
-        </div>
-        <div class="history-panel">
-          <div class="history-title">Frequency and temperature</div>
-          <svg class="history-chart" id="hist-freq" preserveAspectRatio="none"></svg>
-          <div class="history-legend" id="hist-freq-legend"></div>
-        </div>
-        <div class="history-panel">
-          <div class="history-title">GPS reception</div>
-          <svg class="history-chart" id="hist-gps" preserveAspectRatio="none"></svg>
-          <div class="history-legend" id="hist-gps-legend"></div>
-        </div>
-        <div class="history-panel">
-          <div class="history-title">Client traffic</div>
-          <svg class="history-chart" id="hist-traffic" preserveAspectRatio="none"></svg>
-          <div class="history-legend" id="hist-traffic-legend"></div>
-        </div>
-        <div class="history-panel">
-          <div class="history-title">Crystal ageing (last 30 days)</div>
-          <svg class="history-chart" id="hist-ageing" preserveAspectRatio="none"></svg>
-          <div class="history-legend" id="hist-ageing-legend"></div>
-        </div>
-        <div class="history-panel">
-          <div class="history-title">Health</div>
-          <svg class="history-band" id="hist-health" preserveAspectRatio="none"></svg>
-          <div class="history-legend" id="hist-health-legend"></div>
-        </div>
-      </div>
-      <div class="history-axis"><span id="hist-start">&mdash;</span><span id="hist-note"></span><span>now</span></div>
-    </div>
-
-    <div class="section-heading"><span class="marker">&#9658;</span><span>System Telemetry</span></div>
-
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-title">Tracking Detail</div>
-        <div class="stat-row"><span class="stat-key">Reference ID</span><span class="stat-val accent" id="t-refid">—</span></div>
-        <div class="stat-row"><span class="stat-key">Ref Time (UTC)</span><span class="stat-val" id="t-reftime">—</span></div>
-        <div class="stat-row"><span class="stat-key">Update Interval</span><span class="stat-val" id="t-interval">—</span></div>
-        <div class="stat-row"><span class="stat-key">Root Delay</span><span class="stat-val good" id="t-rootdelay">—</span></div>
-        <div class="stat-row"><span class="stat-key">Root Dispersion</span><span class="stat-val" id="t-rootdisp">—</span></div>
-        <div class="stat-row"><span class="stat-key">Residual Freq</span><span class="stat-val" id="t-residfreq">—</span></div>
-        <div class="stat-row"><span class="stat-key">Activity</span><span class="stat-val" id="t-activity">—</span></div>
-      </div>
-
-      <div class="card">
-        <div class="card-title">Hardware Vitals</div>
-        <div class="stat-row"><span class="stat-key">Hostname</span><span class="stat-val accent" id="s-host">—</span></div>
-        <div class="stat-row"><span class="stat-key">IP Address</span><span class="stat-val" id="s-ip">—</span></div>
-        <div class="stat-row"><span class="stat-key">Core Temperature</span><span class="stat-val" id="s-temp">—</span></div>
-        <div class="stat-row"><span class="stat-key">Memory</span><span class="stat-val" id="s-mem">—</span></div>
-        <div class="stat-row"><span class="stat-key">Load Average</span><span class="stat-val" id="s-load">—</span></div>
-        <div class="stat-row"><span class="stat-key">System Uptime</span><span class="stat-val" id="s-uptime">—</span></div>
-        <div class="stat-row"><span class="stat-key">Isolated Cores</span><span class="stat-val amber" id="s-isolated">—</span></div>
-        <div class="stat-row"><span class="stat-key">Leap Data Expiry</span><span class="stat-val" id="s-leap">—</span></div>
-        <div class="stat-row"><span class="stat-key">NTS Certificate</span><span class="stat-val" id="s-cert">—</span></div>
-      </div>
-    </div>
-
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-title">CPU Core Utilization</div>
-        <div id="cpu-cores">—</div>
-      </div>
-      <div class="card">
-        <div class="card-title">NTP Service Statistics</div>
-        <div class="stat-row"><span class="stat-key">NTP Packets Received</span><span class="stat-val good" id="ss-rx">—</span></div>
-        <div class="stat-row"><span class="stat-key">NTP Packets Dropped</span><span class="stat-val" id="ss-drop">—</span></div>
-        <div class="stat-row"><span class="stat-key">Command Packets Received</span><span class="stat-val" id="ss-cmd-rx">—</span></div>
-        <div class="stat-row"><span class="stat-key">Command Packets Dropped</span><span class="stat-val" id="ss-cmd-drop">—</span></div>
-        <div class="stat-row"><span class="stat-key">Client Log Records Dropped</span><span class="stat-val" id="ss-clog">—</span></div>
-      </div>
-    </div>
-
-    <div class="section-heading"><span class="marker">&#9658;</span><span>Global Reference</span></div>
-
-    <div class="card full">
-      <div class="card-title">This Server's Time Around the World</div>
-      <div class="world-clock" id="world-clock">—</div>
-    </div>
-
-    <div class="section-heading"><span class="marker">&#9658;</span><span>Source Network</span></div>
-
-    <div class="card full">
-      <div class="card-title">Time Sources</div>
-      <div class="tbl-wrap">
-        <table>
-          <thead><tr>
-            <th>State</th><th>Source</th><th>Stratum</th><th>Poll</th>
-            <th>Reach</th><th>Last Rx</th><th>Offset</th><th>Margin</th>
-          </tr></thead>
-          <tbody id="sources-body"><tr><td colspan="8" style="color:var(--muted);padding:1rem">Loading...</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="card full">
-      <div class="card-title">Source Statistics</div>
-      <div class="tbl-wrap">
-        <table>
-          <thead><tr>
-            <th>Source</th><th>Samples (NP/NR)</th><th>Span</th>
-            <th>Freq Skew</th><th>Std Dev</th><th>Offset</th>
-          </tr></thead>
-          <tbody id="stats-body"><tr><td colspan="6" style="color:var(--muted);padding:1rem">Loading...</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="card full">
-      <div class="card-title">Connected Clients</div>
-      <div class="tbl-wrap">
-        <table>
-          <thead><tr><th>Client</th><th>NTP Requests</th><th>Drops</th><th>Last Query</th></tr></thead>
-          <tbody id="clients-body"><tr><td colspan="4" style="color:var(--muted);padding:1rem">Loading...</td></tr></tbody>
-        </table>
-      </div>
-      <div id="clients-note" style="display:none;font-size:0.6rem;color:var(--muted);margin-top:0.7rem;letter-spacing:0.08em">Addresses are shortened for viewers outside the server's own network.</div>
-    </div>
-
-  </div>
+  </main>
 
   <footer>
-    &#9670; GPS-Disciplined Stratum 1 &#9670; NTPv4 Compliant &#9670; Refreshing every 5 seconds &#9670;
-    <div id="visitor-stats" style="margin-top:0.6rem;font-size:0.55rem;color:var(--muted);letter-spacing:0.2em;opacity:0.6">
+    &#9670; GPS-Disciplined Stratum 1 &#9670; NTPv4 + NTS &#9670; Refreshing every 5 seconds &#9670;
+    <a href="?display" id="display-link" class="footer-link">Wall display</a>
+    <div id="visitor-stats" class="visitor-stats">
       <span id="visitor-current">&mdash;</span> viewing now &#9670; <span id="visitor-total">&mdash;</span> unique all-time &#9670; dashboard v{version}
     </div>
   </footer>
 
 </div>
+
+<a href="?" class="display-exit" id="display-exit">Exit wall display</a>
 
 <script src="/static/dashboard.js?v={js_version}"></script>
 </body>

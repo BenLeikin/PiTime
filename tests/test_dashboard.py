@@ -234,6 +234,7 @@ class ChronycParserTests(unittest.TestCase):
         self.assertEqual(clients[0]["ntp"], "1234")
         self.assertEqual(clients[0]["drops"], "5")
         self.assertEqual(clients[0]["last_query"], "17")  # not the cmd column
+        self.assertEqual(clients[0]["last_s"], 17)
         self.assertEqual(clients[1]["last_query"], "60m")
 
     def test_clients_not_authorised(self):
@@ -656,6 +657,38 @@ class HistorySummaryTests(TempDirTest):
         self.assertIsNone(self.store([1] * 30).ageing(now=self.NOW)["temp_coeff_ppm_per_c"])
 
 
+class SkyMapTests(TempDirTest):
+    def sat(self, az, el, ss, used=False):
+        return {"az": az, "el": el, "ss": ss, "used": used}
+
+    def test_counts_cells_and_reports_heard_share(self):
+        sky = cd.SkyMap(path=os.path.join(self.dir, "sky.json"), flush_s=3600)
+        for minute in range(10):
+            sky.add([self.sat(275, 35, 0), self.sat(95, 62, 31, used=True), self.sat(None, 10, 20)],
+                    now=1000 + 60 * minute)
+        cells = {(c["az"], c["el"]): c for c in sky.report()["cells"]}
+        self.assertEqual(set(cells), {(270, 30), (90, 60)})
+        west, east = cells[(270, 30)], cells[(90, 60)]
+        self.assertEqual((west["heard_pct"], west["mean_snr"]), (0.0, None))
+        self.assertEqual((east["heard_pct"], east["mean_snr"], east["used_pct"]), (100.0, 31.0, 100.0))
+        self.assertAlmostEqual(east["passes"], 10, delta=0.01)
+
+    def test_old_counts_fade_and_survive_a_restart(self):
+        path = os.path.join(self.dir, "sky.json")
+        sky = cd.SkyMap(path=path, flush_s=0)
+        sky.add([self.sat(10, 45, 40)], now=0)
+        sky.add([], now=7 * 86400)          # one half-life later
+        self.assertAlmostEqual(sky.report()["cells"][0]["passes"], 0.5, places=3)
+        again = cd.SkyMap(path=path)
+        self.assertAlmostEqual(again.report()["cells"][0]["passes"], 0.5, places=3)
+
+    def test_edge_angles(self):
+        sky = cd.SkyMap()
+        sky.add([self.sat(359.9, 90, 30), self.sat(360, 0, 30), self.sat(10, -3, 30)], now=0)
+        keys = sorted((c["az"], c["el"]) for c in sky.report()["cells"])
+        self.assertEqual(keys, [(0, 0), (350, 80)])   # below the horizon is ignored
+
+
 class VersionTests(unittest.TestCase):
     def test_version_matches_the_changelog(self):
         changelog = (ROOT / "CHANGELOG.md").read_text()
@@ -996,6 +1029,25 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(json.loads(body)["range"], "7d")
             self.assertEqual(json.loads(body)["step"], 7 * 86400 / 360)
             self.assertEqual(self.get("/api/history?range=1y")[0], 400)
+
+    def test_fonts_are_served_from_here(self):
+        status, headers, body = self.get("/static/fonts/space-mono-400-latin.woff2")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "font/woff2")
+        self.assertIn("max-age", headers["Cache-Control"])
+        self.assertEqual(body[:4], b"wOF2")
+        self.assertEqual(self.get("/static/fonts/../dashboard.js")[0], 404)
+        csp = self.get("/")[1]["Content-Security-Policy"]
+        self.assertIn("font-src 'self'", csp)
+        self.assertNotIn("googleapis", csp)
+        self.assertNotIn("gstatic", csp)
+
+    def test_skymap_endpoint(self):
+        status, _, body = self.get("/api/skymap")
+        self.assertEqual(status, 200)
+        report = json.loads(body)
+        self.assertEqual((report["az_step"], report["el_step"]), (10, 10))
+        self.assertIsInstance(report["cells"], list)
 
     def test_time_endpoint(self):
         before = time.time()

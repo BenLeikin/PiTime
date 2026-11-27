@@ -42,7 +42,7 @@ function standIn() {
 function loadPage() {
   const elements = {};
   const sandbox = {
-    console, Intl, Date, Math, JSON, AbortController, performance,
+    console, Intl, Date, Math, JSON, AbortController, performance, URLSearchParams,
     setInterval: () => 0,
     setTimeout: () => 0,
     clearTimeout: () => {},
@@ -220,7 +220,7 @@ test('render fills the tables and escapes what remote hosts control', () => {
   assert.ok(elements['clients-body'].innerHTML.includes('192.168.1.20'));
   assert.strictEqual(elements['status-text'].textContent, '◆ NOMINAL ▸ LOCKED & SERVING');
   assert.strictEqual(elements['tx-indicator'].textContent, 'TRANSMITTING');
-  assert.strictEqual(elements['clients-note'].style.display, 'none');
+  assert.strictEqual(elements['clients-note'].hidden, true);
 });
 
 test('render shows faults, lost fixes and the public-viewer note', () => {
@@ -234,7 +234,7 @@ test('render shows faults, lost fixes and the public-viewer note', () => {
   assert.strictEqual(elements['tx-indicator'].textContent, 'NOT SYNCED');
   assert.strictEqual(elements['status-issues'].textContent, 'No synced source');
   assert.match(elements['g-fix-age'].textContent, /^no fix for 5m/);   // epoch 1100 - 800
-  assert.strictEqual(elements['clients-note'].style.display, 'block');
+  assert.strictEqual(elements['clients-note'].hidden, false);
 });
 
 test('time since lock counts from the server record', () => {
@@ -286,4 +286,70 @@ test('link, expiry and GPS-lost display', () => {
                         reference: '7F7F0101 ()', error_bound_s: null }, 1000);
   assert.match(elements['holdover-text'].textContent, /FREE-RUNNING/);
   assert.match(elements['holdover-detail'].textContent, /^over 1m 40s without GPS$/);
+});
+
+test('signal bars: one per satellite, sorted, classed by use and strength', () => {
+  const { page } = loadPage();
+  const html = page.satBarsHtml([
+    { prn: 27, ss: 20, used: true }, { prn: 4, ss: 30, used: false },
+    { prn: 9, ss: 0, used: false }, { prn: 16, ss: 14, used: false },
+  ]);
+  const order = [...html.matchAll(/sat-prn">(\d+)</g)].map(m => Number(m[1]));
+  assert.deepStrictEqual(order, [4, 9, 16, 27]);
+  assert.match(html, /sat-bar heard" title="Satellite 4: 30 dB-Hz"/);
+  assert.match(html, /sat-bar silent" title="Satellite 9: no signal"/);
+  assert.match(html, /sat-bar weak" title="Satellite 16: 14 dB-Hz"/);
+  assert.match(html, /sat-bar used" title="Satellite 27: 20 dB-Hz, used in the fix"/);
+  assert.match(page.satBarsHtml([]), /no satellites listed/);
+  assert.match(page.satBarsHtml([{ prn: '<b>', ss: 30 }]), /&lt;b&gt;/);
+});
+
+test('sky map verdicts and blocked directions', () => {
+  const { page } = loadPage();
+  assert.strictEqual(page.skyCellClass({ passes: 10, heard_pct: 0 }), 'unknown');
+  assert.strictEqual(page.skyCellClass({ passes: 100, heard_pct: 5 }), 'blocked');
+  assert.strictEqual(page.skyCellClass({ passes: 100, heard_pct: 90, mean_snr: 20 }), 'weak');
+  assert.strictEqual(page.skyCellClass({ passes: 100, heard_pct: 90, mean_snr: 38 }), 'good');
+  const cells = [];
+  for (let az = 0; az < 360; az += 10) {
+    for (let el = 10; el < 90; el += 10) {
+      // Low sky blocked towards W and NW; high sky clear everywhere.
+      const blocked = az >= 250 && az < 320 && el < 45;
+      cells.push({ az, el, passes: 200, heard_pct: blocked ? 2 : 95, mean_snr: 35 });
+    }
+  }
+  assert.deepStrictEqual([...page.blockedDirections(cells)], ['W', 'NW']);
+});
+
+test('offset bars place offsets on a powers-of-ten scale', () => {
+  const { page } = loadPage();
+  assert.strictEqual(page.offsetPosition(0), 50);
+  assert.strictEqual(page.offsetPosition(1e-9), 50);
+  assert.strictEqual(page.offsetPosition(1e-1), 100);       // 100 ms: the right edge
+  assert.strictEqual(page.offsetPosition(-1e-1), 0);
+  assert.strictEqual(page.offsetPosition(1e-5), 75);        // 10 us: half way out
+  assert.ok(page.offsetPosition(5) <= 100);                 // beyond the scale: clamped
+  assert.match(page.offsetBar(1.2e-8, 1e-7), /dot good/);
+  assert.match(page.offsetBar(-0.002, 0.02), /dot bad/);
+  assert.strictEqual(page.offsetBar(null), '');
+});
+
+test('clients are sorted by last request and localhost is left out', () => {
+  const { page } = loadPage();
+  const view = page.clientsView([
+    { host: '127.0.0.1', last_s: 1 }, { host: '10.0.0.5', last_s: 900 },
+    { host: '10.0.0.6', last_s: 30 }, { host: '10.0.0.7', last_s: 7200 }, { host: '::1', last_s: 2 },
+  ]);
+  assert.deepStrictEqual(view.sorted.map(c => c.host), ['10.0.0.6', '10.0.0.5', '10.0.0.7']);
+  assert.strictEqual(view.total, 3);
+  assert.strictEqual(view.recent, 2);
+});
+
+test('history starts at the first sample and labels time in the server zone', () => {
+  const { page } = loadPage();
+  assert.strictEqual(page.firstDataIndex([[null, null, 3, 4], [null, 1, null, null]]), 1);
+  assert.strictEqual(page.firstDataIndex([[null], [null]]), -1);
+  // 12:00 UTC is 13:00 in Berlin (the test page's zone) in winter.
+  assert.strictEqual(page.timeLabel(Date.UTC(2026, 10, 26, 12, 0) / 1000, 3600), '13:00');
+  assert.strictEqual(page.timeLabel(Date.UTC(2026, 10, 26, 12, 0) / 1000, 7 * 86400), 'Nov 26');
 });

@@ -1,4 +1,28 @@
+/* Fonts served by this server (SIL Open Font License; see fonts/OFL-*.txt). */
+@font-face {
+  font-family: 'Orbitron';
+  font-style: normal;
+  font-weight: 400 900;
+  font-display: swap;
+  src: url('/static/fonts/orbitron-latin.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Space Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/static/fonts/space-mono-400-latin.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Space Mono';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/static/fonts/space-mono-700-latin.woff2') format('woff2');
+}
+
 :root {
+  --grid: rgba(45,74,120,0.35);
   --bg-0: #03060a;
   --bg-1: #050a12;
   --bg-2: #0a121e;
@@ -799,7 +823,7 @@ footer {
   text-transform: uppercase;
   animation: blink 1.5s ease-in-out infinite;
 }
-#dashboard { display: none; }
+#dashboard:focus { outline: none; }
 
 .mission-patch svg path,
 .mission-patch svg circle,
@@ -870,4 +894,169 @@ footer {
 .banner .issues {
   font-family: var(--mono); font-weight: 400; text-transform: none;
   letter-spacing: 0.02em; color: var(--text); font-size: 0.78rem;
+}
+
+/* ===================================================================== */
+/* Status summary tiles                                                    */
+/* ===================================================================== */
+.summary-tiles {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0.8rem; margin-bottom: 1rem;
+}
+.tile {
+  background: var(--surface); border: 1px solid var(--border); padding: 0.8rem 1rem 0.9rem;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+}
+.tile-label {
+  font-family: var(--display); font-size: 0.7rem; letter-spacing: 0.18em; text-transform: uppercase;
+  color: var(--cyan-text); margin-bottom: 0.45rem;
+}
+.tile-val {
+  font-family: var(--display); font-weight: 700; font-size: clamp(1.15rem, 2.2vw, 1.6rem);
+  color: var(--heading); line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tile-val.good { color: var(--green); }
+.tile-val.accent { color: var(--cyan); }
+.tile-val.bad { color: var(--red); }
+.tile-sub { font-size: 0.72rem; color: var(--muted); margin-top: 0.35rem; line-height: 1.4; }
+@media (max-width: 600px) { .summary-tiles { grid-template-columns: 1fr 1fr; } }
+
+/* ===================================================================== */
+/* GPS: signal bars and the sky visibility map                             */
+/* ===================================================================== */
+.skyview-meta { margin-left: 1.2rem; color: var(--text); }
+.sat-bars-head {
+  font-size: 0.7rem; color: var(--muted); padding: 0.4rem 1.2rem 0; letter-spacing: 0.05em;
+}
+.sat-bars {
+  display: flex; align-items: flex-end; gap: 4px; height: 92px; padding: 0.4rem 1.2rem 0.8rem;
+  overflow-x: auto;
+}
+.sat-bar { flex: 1 0 18px; max-width: 34px; height: 100%; display: flex; flex-direction: column;
+  justify-content: flex-end; align-items: center; position: relative; }
+.sat-fill { width: 100%; min-height: 2px; background: var(--muted); opacity: 0.6; border-radius: 1px 1px 0 0; }
+.sat-bar.used .sat-fill { background: var(--green); opacity: 0.9; }
+.sat-bar.heard .sat-fill { background: var(--cyan); opacity: 0.7; }
+.sat-bar.weak .sat-fill { background: var(--amber); opacity: 0.7; }
+.sat-ss { position: absolute; top: 0; font-size: 0.7rem; color: var(--text); }
+.sat-prn { font-size: 0.7rem; color: var(--muted); margin-top: 2px; }
+.skymap-canvas { width: 100%; max-width: 340px; aspect-ratio: 1; display: block; margin: 0.4rem auto 0; }
+
+/* ===================================================================== */
+/* Charts: axes, crosshair, readout                                        */
+/* ===================================================================== */
+.chart-box { position: relative; }
+.axis-label { font-family: var(--mono); font-size: 10px; }
+.crosshair {
+  display: none; position: absolute; top: 0; bottom: 0; width: 1px; background: var(--text);
+  opacity: 0.5; pointer-events: none;
+}
+.chart-tip {
+  display: none; position: absolute; top: 4px; z-index: 5; pointer-events: none; white-space: pre;
+  background: var(--surface-2); border: 1px solid var(--border-glow); color: var(--text);
+  font-size: 0.7rem; padding: 0.35rem 0.5rem; line-height: 1.45;
+}
+.history-axis { display: flex; justify-content: space-between; }
+.history-note { font-size: 0.7rem; color: var(--muted); margin-top: 0.45rem; text-align: center; }
+
+/* ===================================================================== */
+/* Network: offset bars, clients                                           */
+/* ===================================================================== */
+.offset-bar { width: 140px; height: 12px; display: block; }
+.offset-bar .zero { stroke: var(--muted); stroke-width: 0.6; }
+.offset-bar .margin { stroke: var(--muted); stroke-width: 2; stroke-linecap: round; opacity: 0.7; }
+.offset-bar .dot { stroke: none; }
+.offset-bar .dot.good { fill: var(--green); }
+.offset-bar .dot.accent { fill: var(--cyan); }
+.offset-bar .dot.bad { fill: var(--red); }
+.clients-summary { font-size: 0.8rem; color: var(--text); margin: 0.2rem 0 0.6rem; }
+.empty { color: var(--muted); padding: 1rem; }
+.note { font-size: 0.7rem; color: var(--muted); margin-top: 0.7rem; letter-spacing: 0.04em; }
+
+/* Collapsible sections */
+details.collapsible > summary {
+  cursor: pointer; list-style: none; font-size: 0.75rem; color: var(--cyan-text);
+  padding: 0.3rem 0; user-select: none;
+}
+details.collapsible > summary::-webkit-details-marker { display: none; }
+details.collapsible > summary::before { content: '\25B8  '; color: var(--amber); }
+details.collapsible[open] > summary::before { content: '\25BE  '; }
+details.section-details > summary.section-heading { font-size: 0.7rem; }
+details.section-details > summary.section-heading::before { content: none; }
+details.section-details > summary .marker { display: inline-block; transition: transform 0.2s; }
+details.section-details[open] > summary .marker { transform: rotate(90deg); }
+
+/* Footer */
+.footer-link { color: var(--cyan-text); text-decoration: none; margin-left: 0.5rem; }
+.footer-link:hover { text-decoration: underline; }
+.visitor-stats { margin-top: 0.6rem; font-size: 0.7rem; color: var(--muted); letter-spacing: 0.15em; }
+
+/* ===================================================================== */
+/* Keyboard and screen readers                                             */
+/* ===================================================================== */
+:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.skip-link {
+  position: absolute; left: -999px; top: 0.5rem; z-index: 50; background: var(--surface-2);
+  color: var(--cyan); padding: 0.4rem 0.8rem; border: 1px solid var(--cyan);
+}
+.skip-link:focus { left: 0.5rem; }
+
+/* ===================================================================== */
+/* Before the first data arrives: placeholders pulse gently               */
+/* ===================================================================== */
+@keyframes placeholder { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.8; } }
+body.loading .stat-val, body.loading .tile-val, body.loading #status-text {
+  animation: placeholder 1.6s ease-in-out infinite;
+}
+
+/* ===================================================================== */
+/* Wall display (?display): clock, status and key numbers, large           */
+/* ===================================================================== */
+.display-exit { display: none; }
+body.display-mode .display-exit {
+  display: block; position: fixed; right: 1rem; bottom: 1rem; font-size: 0.7rem;
+  color: var(--muted); text-decoration: none; opacity: 0.6;
+}
+body.display-mode header .mission-patch,
+body.display-mode header .header-text,
+body.display-mode header .header-meta,
+body.display-mode #refresh-bar,
+body.display-mode main > section:not(:first-of-type),
+body.display-mode main > details,
+body.display-mode .fun-fact,
+body.display-mode footer,
+body.display-mode .section-heading,
+body.display-mode .skip-link { display: none; }
+body.display-mode .wrap { max-width: none; min-height: 100vh; display: flex; flex-direction: column; justify-content: center; }
+body.display-mode header { justify-content: center; border: none; background: none; }
+body.display-mode header { display: block; text-align: center; padding: 2rem 0 1rem; }
+body.display-mode .local-time-block { border: none; margin: 0 auto 3rem; padding: 0; width: auto; }
+body.display-mode .local-time-block .lt-label { font-size: clamp(0.9rem, 1.8vw, 1.4rem); }
+body.display-mode .local-time-block .lt-value { font-size: clamp(1.8rem, 9vw, 9rem); line-height: 1.05; }
+body.display-mode .local-time-block .lt-date { font-size: clamp(0.9rem, 1.8vw, 1.4rem); }
+body.display-mode .local-time-block .lt-device { font-size: clamp(0.9rem, 1.6vw, 1.3rem); }
+body.display-mode .summary-tiles { grid-template-columns: repeat(5, 1fr); }
+body.display-mode .tile-val { font-size: clamp(1.4rem, 3.4vw, 2.8rem); }
+body.display-mode .banner { font-size: 1.2rem; }
+@media (max-width: 700px) {
+  body.display-mode .summary-tiles { grid-template-columns: 1fr 1fr; }
+}
+
+/* ===================================================================== */
+/* Light theme, when the viewer's device asks for one                      */
+/* ===================================================================== */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg-0: #eef2f7; --bg-1: #e6ecf3; --bg-2: #f4f7fb;
+    --surface: #ffffff; --surface-2: #f2f5f9;
+    --border: #c9d4e2; --border-glow: #9fb3cc; --grid: rgba(80,100,130,0.25);
+    --cyan: #006f99; --cyan-dim: #7fb3cc; --cyan-text: #005f82;
+    --amber: #9a5800; --amber-dim: #d9b37a;
+    --green: #0b7a3e; --green-dim: #7cc49c;
+    --red: #c0122e; --yellow: #8a6d00; --magenta: #a3006c; --blue: #2456b3;
+    --muted: #556479; --text: #1d2836; --heading: #0c1520;
+  }
+  body::before, body::after { display: none; }
+  .skyview-header { background: var(--surface-2); }
+  .tz-cell, .card, .tile { box-shadow: 0 1px 2px rgba(20,40,70,0.06); }
+  .hero-stat .val, .tile-val, .banner, .lt-value, .tz-cell .time { text-shadow: none !important; }
 }

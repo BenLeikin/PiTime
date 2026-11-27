@@ -2,6 +2,27 @@
 
 Notable changes to this project. Versions follow [semantic versioning](https://semver.org/): the major number changes when an upgrade needs action on an existing install.
 
+## [2.4.0] - 2026-11-26
+
+### Added
+
+- **Status at the top**: the status with its reasons, then five tiles - the server's offset, its error bound, stratum, time on GPS over 24 hours, and how far your own device's clock is off.
+- **Signal bars**: one bar per satellite under the sky view, its height the signal strength, coloured by whether it is used.
+- **Sky visibility map**: over days, where satellites are heard and where they never are, with the blocked directions named. Counts fade with a 7-day half-life, so moving the antenna shows within days. `/api/skymap` serves the grid.
+- **Agreement column** in the time sources table: each source's offset and error margin on a scale even in powers of ten.
+- **Readable history charts**: value labels on each axis, a time axis in the server's zone, a crosshair readout of the values under the pointer, and charts that start at the first sample while the history is shorter than the chosen range.
+- **The browser tab** shows the status: a green, amber or red dot as the icon, and "OK", "DEGRADED", "FAULT" or "NO LINK" in the title.
+- **Wall display**: `?display` (linked in the footer) shows only the clock, the status and the tiles, large.
+- **Light theme** when the viewer's device asks for one.
+
+### Changed
+
+- Sections in order of importance: status, GPS, history, network, then system details folded away (remembered per browser). Hostname, IP, uptime and temperature are no longer repeated in the header.
+- Green, amber and red are used only for good, warning and bad; plain values are plain.
+- Clients: a summary line (how many, how many in the last hour, requests an hour), then the list sorted by most recent, folded away; localhost is left out.
+- The fonts (Orbitron, Space Mono) are served by the dashboard itself, so viewers' browsers no longer contact Google; the Content-Security-Policy allows fonts from this server only.
+- The page appears at once with placeholders instead of a loading screen; keyboard focus is visible, the status is announced to screen readers, and charts have text descriptions.
+
 ## [2.3.0] - 2026-11-26
 
 ### Fixed

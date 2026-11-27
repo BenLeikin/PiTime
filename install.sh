@@ -115,7 +115,9 @@ fi
 log "Installing dashboard to $APP_DIR"
 install -d -m 0755 "$APP_DIR" "$APP_DIR/static"
 install -m 0644 "$SRC/dashboard/chrony_dashboard.py" "$APP_DIR/chrony_dashboard.py"
-install -m 0644 "$SRC"/dashboard/static/* "$APP_DIR/static/"
+install -d -m 0755 "$APP_DIR/static/fonts"
+install -m 0644 "$SRC"/dashboard/static/*.* "$APP_DIR/static/"
+install -m 0644 "$SRC"/dashboard/static/fonts/* "$APP_DIR/static/fonts/"
 rm -rf "$APP_DIR/__pycache__"
 install -m 0644 "$SRC/systemd/$UNIT" "/etc/systemd/system/$UNIT"
 # The unit reads the dashboard's site options from here.

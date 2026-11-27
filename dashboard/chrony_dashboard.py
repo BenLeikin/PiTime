@@ -36,7 +36,7 @@ from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, UTC
 
 # Keep in step with the newest entry in CHANGELOG.md (a test checks it).
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 log = logging.getLogger("chrony-dashboard")
 log.addHandler(logging.NullHandler())  # main() sets up real logging
@@ -461,6 +461,7 @@ def parse_clients():
             "drops":      row[2],
             "interval":   row[3],
             "last_query": fmt_interval(row[5]),
+            "last_s":     safe_int(row[5]),
         })
     return clients
 
@@ -1530,11 +1531,121 @@ HISTORY = HistoryStore()
 _history_cache = {}   # range name -> (monotonic time, response)
 
 
+class SkyMap:
+    """Where in the sky satellites are heard, and where they never are.
+
+    Every minute each satellite the receiver lists is counted in a cell of a
+    grid over azimuth and elevation, with whether a signal was heard and how
+    strong. Over days the satellites sweep most of the sky, so cells that are
+    passed through but never heard show what blocks the antenna's view.
+    Counts fade with a 7-day half-life, so moving the antenna shows up within
+    days. Saved to disk every 10 minutes.
+    """
+
+    AZ_STEP = 10      # degrees
+    EL_STEP = 10
+    HALF_LIFE_S = 7 * 86400
+
+    def __init__(self, path=None, flush_s=600):
+        self.path = path
+        self.flush_s = flush_s
+        self.cells = {}            # "az,el" -> [passes, heard, signal_sum, used]
+        self.updated = None
+        self._lock = threading.Lock()
+        self._loaded = False
+        self._last_flush = time.monotonic()
+
+    def _load(self):
+        self._loaded = True
+        if not self.path:
+            return
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+            self.cells = {k: list(v) for k, v in data.get("cells", {}).items()}
+            self.updated = data.get("updated")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, AttributeError) as e:
+            warn("skymap", f"sky map {self.path} unreadable, starting empty: {e}")
+
+    def _save(self):
+        if not self.path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"updated": self.updated, "cells": self.cells}, f)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            warn("skymap-save", f"cannot save {self.path}: {e}")
+
+    def add(self, satellites, now=None):
+        """Count one observation of the listed satellites."""
+        now = time.time() if now is None else now
+        with self._lock:
+            if not self._loaded:
+                self._load()
+            if self.updated is not None and now > self.updated:
+                fade = 0.5 ** ((now - self.updated) / self.HALF_LIFE_S)
+                for cell in self.cells.values():
+                    for i in range(4):
+                        cell[i] *= fade
+            self.updated = now
+            for sat in satellites:
+                el, az, ss = sat.get("el"), sat.get("az"), sat.get("ss") or 0
+                if el is None or az is None or el < 0:
+                    continue
+                key = (f"{int(az % 360) // self.AZ_STEP * self.AZ_STEP},"
+                       f"{min(int(el), 89) // self.EL_STEP * self.EL_STEP}")
+                cell = self.cells.setdefault(key, [0.0, 0.0, 0.0, 0.0])
+                cell[0] += 1
+                if ss > 0:
+                    cell[1] += 1
+                    cell[2] += ss
+                if sat.get("used"):
+                    cell[3] += 1
+            # Forget cells that have faded to nothing.
+            for key in [k for k, c in self.cells.items() if c[0] < 0.01]:
+                del self.cells[key]
+            if time.monotonic() - self._last_flush >= self.flush_s:
+                self._save()
+                self._last_flush = time.monotonic()
+
+    def flush(self):
+        """Save now."""
+        with self._lock:
+            self._save()
+
+    def report(self):
+        """The grid for the page: one entry per cell that has seen satellites."""
+        with self._lock:
+            if not self._loaded:
+                self._load()
+            cells = []
+            for key, (passes, heard, signal, used) in self.cells.items():
+                az, el = (int(v) for v in key.split(","))
+                cells.append({"az": az, "el": el, "passes": round(passes, 2),
+                              "heard_pct": round(100 * heard / passes, 1) if passes else None,
+                              "mean_snr": round(signal / heard, 1) if heard else None,
+                              "used_pct": round(100 * used / passes, 1) if passes else None})
+            return {"az_step": self.AZ_STEP, "el_step": self.EL_STEP,
+                    "half_life_days": self.HALF_LIFE_S / 86400, "cells": cells}
+
+
+SKYMAP = SkyMap()
+
+
 def _history_recorder(interval=60):
     """Add one sample a minute to HISTORY. Runs as a daemon thread."""
     while True:
         try:
-            HISTORY.add(history_sample(STATUS_CACHE.get()))
+            snapshot = STATUS_CACHE.get()
+            HISTORY.add(history_sample(snapshot))
+            gps = snapshot.get("gps", {})
+            if gps.get("available"):
+                SKYMAP.add(gps.get("satellites", []))
         except Exception:  # noqa: BLE001 - the recorder must outlive any bug
             log.exception("history: could not record a sample")
         time.sleep(interval - time.time() % interval)
@@ -1548,8 +1659,8 @@ SECURITY_HEADERS = {
         # Scripts only from this server: the page has no inline script.
         "script-src 'self'; "
         # 'unsafe-inline' is for style="" attributes (bar widths and the like).
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src https://fonts.gstatic.com; "
+        "style-src 'self' 'unsafe-inline'; "
+        "font-src 'self'; "
         "img-src 'self' data:; "
         "connect-src 'self'; "
         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
@@ -1562,6 +1673,13 @@ SECURITY_HEADERS = {
 # All three are read once at startup and kept in memory, plain and gzipped.
 # ============================================================================
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+FONT_FILES = {
+    # Served from the Pi so viewers' browsers do not contact Google. Both
+    # fonts are under the SIL Open Font License (licences next to them).
+    "/static/fonts/orbitron-latin.woff2": "fonts/orbitron-latin.woff2",
+    "/static/fonts/space-mono-400-latin.woff2": "fonts/space-mono-400-latin.woff2",
+    "/static/fonts/space-mono-700-latin.woff2": "fonts/space-mono-700-latin.woff2",
+}
 STATIC_FILES = {
     "/static/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/static/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
@@ -1600,6 +1718,16 @@ def load_page(hostname=None, tz=None, static_dir=STATIC_DIR):
         ASSETS[url] = {"body": body, "gzip": gzip.compress(body, 9),
                        "type": content_type, "version": version}
         versions[filename] = version
+    for url, filename in FONT_FILES.items():
+        try:
+            with open(os.path.join(static_dir, filename), "rb") as f:
+                body = f.read()
+        except OSError as e:
+            warn("fonts", f"font {filename} missing, the page falls back to system fonts: {e}")
+            continue
+        # woff2 is already compressed; no gzip copy.
+        ASSETS[url] = {"body": body, "gzip": body, "type": "font/woff2",
+                       "version": None, "font": True}
     with open(os.path.join(static_dir, "index.html"), encoding="utf-8") as f:
         html = f.read()
     html = (html
@@ -1688,6 +1816,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001 - see above
                 log.exception("could not build the health report")
                 self.send_json({"status": "ERROR"}, status=500)
+        elif path == "/api/skymap":
+            self.send_json(SKYMAP.report())
         elif path == "/api/time":
             # The server's clock, read as late as possible before answering,
             # for the page to work out how far the viewer's clock is off.
@@ -1713,6 +1843,9 @@ class Handler(BaseHTTPRequestHandler):
             asset = ASSETS[path]
             # Only the URL the page links to (with its version) is cacheable
             # for good; anything else must be revalidated.
+            if asset.get("font"):
+                self._send(200, asset["body"], asset["type"], cache="public, max-age=2592000")
+                return
             current = parse_qs(url.query).get("v", [""])[0] == asset["version"]
             self._send_compressible(
                 asset, asset["type"],
@@ -1761,6 +1894,7 @@ def main():
     TRUSTED_PROXIES.update(args.trusted_proxy)
     VISITORS.path = os.path.join(args.state_dir, os.path.basename(VISITOR_FILE))
     HISTORY.path = os.path.join(args.state_dir, os.path.basename(HISTORY_FILE))
+    SKYMAP.path = os.path.join(args.state_dir, "skymap.json")
     load_page(tz=args.timezone)
     threading.Thread(target=_gps_monitor, name="gps-monitor", daemon=True).start()
     threading.Thread(target=_history_recorder, name="history", daemon=True).start()
@@ -1777,6 +1911,7 @@ def main():
         log.info("stopping")
     finally:
         HISTORY.flush()
+        SKYMAP.flush()
 
 
 if __name__ == "__main__":

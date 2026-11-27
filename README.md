@@ -129,7 +129,7 @@ Everything specific to one site (who may use the server, the NTS host name, the 
 | Path | Installed to | Purpose |
 |---|---|---|
 | `dashboard/chrony_dashboard.py` | `/opt/chrony-dashboard/` | Dashboard server and data collectors |
-| `dashboard/static/` | `/opt/chrony-dashboard/static/` | The page: `index.html`, `dashboard.css`, `dashboard.js` |
+| `dashboard/static/` | `/opt/chrony-dashboard/static/` | The page: `index.html`, `dashboard.css`, `dashboard.js`, and `fonts/` (Orbitron and Space Mono, SIL Open Font License) |
 | `systemd/chrony-webpage.service` | `/etc/systemd/system/` | Dashboard service (runs as `_chrony`, sandboxed) |
 | `site/etc/default/chrony-dashboard` | `/etc/default/` | **Site setting:** dashboard options (reverse proxy address, time zone) |
 | `site/etc/chrony/conf.d/site.conf` | `/etc/chrony/conf.d/` | **Site setting:** who may use the server, NTS certificate and host name |
@@ -194,6 +194,9 @@ The service takes its site options from `DASHBOARD_OPTS` in
 - `GET /` serves the page; its stylesheet and script are under `/static/`.
 - `GET /api/status` returns the full JSON snapshot. One snapshot is shared by
   all viewers for `--cache-ttl` seconds.
+- `GET /api/skymap` returns the sky visibility grid: for each 10-degree cell,
+  how often satellites passed through it and how often they were heard.
+- `GET /?display` is a wall-display view: clock, status and key numbers only.
 - `GET /api/time` returns the server's clock (`{"now": seconds}`), read as
   late as possible; the page uses it to show the server's time and how far
   the viewer's device clock is off.

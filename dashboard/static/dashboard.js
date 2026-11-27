@@ -120,6 +120,7 @@ function projectSat(el, az, w, h) {
 }
 
 function drawSky() {
+  const colours = palette();
   const w = canvasW;
   const h = canvasH;
   ctx.clearRect(0, 0, w, h);
@@ -165,7 +166,7 @@ function drawSky() {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  ctx.fillStyle = '#00d4ff';
+  ctx.fillStyle = colours.cyan;
   ctx.font = "bold 11px 'Orbitron', sans-serif";
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
@@ -174,7 +175,7 @@ function drawSky() {
   ctx.fillText('E', cx + r + 12, cy);
   ctx.fillText('W', cx - r - 12, cy);
 
-  ctx.fillStyle = '#7f93b2';
+  ctx.fillStyle = palette().muted;
   ctx.font = "9px 'Space Mono', monospace";
   ctx.fillText('30\u00b0', cx + 4, cy - r * 0.667 + 2);
   ctx.fillText('60\u00b0', cx + 4, cy - r * 0.333 + 2);
@@ -193,8 +194,8 @@ function drawSky() {
       ctx.stroke();
 
       ctx.shadowBlur = 14;
-      ctx.shadowColor = '#00ff88';
-      ctx.fillStyle = '#00ff88';
+      ctx.shadowColor = colours.green;
+      ctx.fillStyle = colours.green;
       ctx.beginPath();
       ctx.arc(x, y, 4 + Math.min(ss / 12, 4), 0, 2 * Math.PI);
       ctx.fill();
@@ -215,19 +216,19 @@ function drawSky() {
       ctx.fill();
     }
 
-    ctx.fillStyle = used ? '#00ff88' : 'rgba(127,147,178,0.9)';
+    ctx.fillStyle = used ? colours.green : 'rgba(127,147,178,0.9)';
     ctx.font = "bold 10px 'Space Mono', monospace";
     ctx.fillText(sat.prn, x, y + (used ? 22 : 12));
   }
 
-  ctx.strokeStyle = '#ffaa00';
+  ctx.strokeStyle = colours.amber;
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.arc(cx, cy, 6, 0, 2 * Math.PI);
   ctx.moveTo(cx - 10, cy); ctx.lineTo(cx + 10, cy);
   ctx.moveTo(cx, cy - 10); ctx.lineTo(cx, cy + 10);
   ctx.stroke();
-  ctx.fillStyle = '#ffaa00';
+  ctx.fillStyle = colours.amber;
   ctx.beginPath();
   ctx.arc(cx, cy, 1.5, 0, 2 * Math.PI);
   ctx.fill();
@@ -282,6 +283,7 @@ function updateSats(newSats) {
 requestAnimationFrame(animateSats);
 
 function drawSparkline(values) {
+  const colours = palette();
   const svg = document.getElementById('pps-spark');
   while (svg.firstChild) svg.removeChild(svg.firstChild);
   if (!values || values.length === 0) {
@@ -289,7 +291,7 @@ function drawSparkline(values) {
     text.setAttribute('x', '50%');
     text.setAttribute('y', '50%');
     text.setAttribute('text-anchor', 'middle');
-    text.setAttribute('fill', '#7f93b2');
+    text.setAttribute('fill', palette().muted);
     text.setAttribute('font-family', 'Space Mono');
     text.setAttribute('font-size', '10');
     text.textContent = 'COLLECTING - chrony makes one PPS sample every poll';
@@ -326,7 +328,7 @@ function drawSparkline(values) {
     zeroLine.setAttribute('x2', w);
     zeroLine.setAttribute('y1', zeroY);
     zeroLine.setAttribute('y2', zeroY);
-    zeroLine.setAttribute('stroke', '#ffaa00');
+    zeroLine.setAttribute('stroke', colours.amber);
     zeroLine.setAttribute('stroke-dasharray', '4,3');
     zeroLine.setAttribute('opacity', '0.4');
     svg.appendChild(zeroLine);
@@ -342,8 +344,8 @@ function drawSparkline(values) {
   pathStr += ` L ${w} ${h} Z`;
 
   const fillGrad = `<defs><linearGradient id="ppsGrad" x1="0" x2="0" y1="0" y2="1">
-    <stop offset="0%" stop-color="#00d4ff" stop-opacity="0.3"/>
-    <stop offset="100%" stop-color="#00d4ff" stop-opacity="0"/>
+    <stop offset="0%" stop-color="${colours.cyan}" stop-opacity="0.3"/>
+    <stop offset="100%" stop-color="${colours.cyan}" stop-opacity="0"/>
   </linearGradient></defs>`;
   svg.insertAdjacentHTML('afterbegin', fillGrad);
 
@@ -361,7 +363,7 @@ function drawSparkline(values) {
   const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
   path.setAttribute('d', d);
   path.setAttribute('fill', 'none');
-  path.setAttribute('stroke', '#00d4ff');
+  path.setAttribute('stroke', colours.cyan);
   path.setAttribute('stroke-width', '1.5');
   path.setAttribute('filter', 'drop-shadow(0 0 4px rgba(0,212,255,0.6))');
   svg.appendChild(path);
@@ -372,8 +374,8 @@ function drawSparkline(values) {
   dot.setAttribute('cx', lastX);
   dot.setAttribute('cy', lastY);
   dot.setAttribute('r', '3.5');
-  dot.setAttribute('fill', '#00d4ff');
-  dot.setAttribute('filter', 'drop-shadow(0 0 6px #00d4ff)');
+  dot.setAttribute('fill', colours.cyan);
+  dot.setAttribute('filter', `drop-shadow(0 0 6px ${colours.cyan})`);
   svg.appendChild(dot);
 }
 
@@ -459,6 +461,16 @@ function deviceOffsetText(offsetMs, uncertaintyMs) {
 }
 
 function showDeviceOffset() {
+  const tile = document.getElementById('sum-device');
+  if (tile) {
+    const o = timeSync.offsetMs;
+    const margin = Math.max(timeSync.uncertaintyMs || 0, DEVICE_CLOCK_FLOOR_MS);
+    tile.textContent = o == null ? '\u2014' : Math.abs(o) <= margin ? 'right'
+      : `${describeMs(o)} ${o > 0 ? 'slow' : 'fast'}`;
+    tile.classList.remove('good', 'accent', 'bad');
+    if (o != null) tile.classList.add(Math.abs(o) <= margin ? 'good' : Math.abs(o) < 1000 ? 'accent' : 'bad');
+    setText('sum-device-sub', o == null ? 'compared with this server' : `\u00b1${describeMs(margin)}, compared with this server`);
+  }
   const el = document.getElementById('lt-device');
   if (!el) return;
   el.textContent = deviceOffsetText(timeSync.offsetMs, timeSync.uncertaintyMs);
@@ -623,6 +635,7 @@ function render(d) {
 
   if (gps.satellites) {
     updateSats(gps.satellites);
+    renderSatBars(gps.satellites);
     setText('skyview-meta', `${gps.sats_used || 0} LOCKED \u25C6 ${gps.sats_visible || 0} VISIBLE`);
   }
 
@@ -650,9 +663,12 @@ function render(d) {
   colorizeOffset(secondsText(t.last_offset_s, t.last_offset), t.last_offset_s, 'h-sys-offset');
   setText('h-rms-offset', 'RMS ' + secondsText(t.rms_offset_s, t.rms_offset).replace(/^-/, ''));
   setText('h-stratum', t.stratum);
+  const bound = d.sync && typeof d.sync.error_bound_s === 'number' ? d.sync.error_bound_s : null;
+  setText('sum-bound', bound != null ? '\u00b1' + formatSecondsAsHuman(bound) : '\u2014');
+  updateTabStatus(health.status, s.hostname);
   setText('h-leap', 'Leap ' + t.leap_status);
   setText('h-freq', t.freq_error);
-  setText('h-skew', 'Skew ' + t.skew);
+  setText('h-skew', t.skew);
 
   setText('t-refid', t.reference_id);
   setText('t-reftime', t.ref_time);
@@ -722,7 +738,7 @@ function render(d) {
 
   const sb = document.getElementById('sources-body');
   if (sources.length === 0) {
-    sb.innerHTML = '<tr><td colspan="8" style="color:var(--muted);padding:1rem">No sources</td></tr>';
+    sb.innerHTML = '<tr><td colspan="9" class="empty">No sources</td></tr>';
   } else {
     sb.innerHTML = sources.map(src => {
       return `
@@ -735,6 +751,7 @@ function render(d) {
         <td>${esc(src.last_rx)}</td>
         <td>${esc(src.last_sample_offset)}</td>
         <td>${esc(src.margin)}</td>
+        <td>${offsetBar(src.offset_s, src.error_s)}</td>
       </tr>`;
     }).join('');
   }
@@ -755,10 +772,11 @@ function render(d) {
   }
 
   const cb = document.getElementById('clients-body');
-  if (clients.length === 0) {
-    cb.innerHTML = '<tr><td colspan="4" style="color:var(--muted);padding:1rem">No clients yet</td></tr>';
+  const view = clientsView(clients);
+  if (view.total === 0) {
+    cb.innerHTML = '<tr><td colspan="4" class="empty">No clients yet</td></tr>';
   } else {
-    cb.innerHTML = clients.map(c => `
+    cb.innerHTML = view.sorted.map(c => `
       <tr>
         <td>${esc(c.host)}</td>
         <td>${esc(c.ntp)}</td>
@@ -766,8 +784,12 @@ function render(d) {
         <td>${esc(c.last_query)}</td>
       </tr>`).join('');
   }
-
-  document.getElementById('clients-note').style.display = d.redacted ? 'block' : 'none';
+  const perHour = lastHistory && lastHistory.fields.ntp_requests
+    ? lastValue(lastHistory.fields.ntp_requests) : null;
+  setText('clients-summary', view.total === 0 ? 'No clients yet'
+    : `${view.total} client${view.total === 1 ? '' : 's'} seen, ${view.recent} in the last hour` +
+      (perHour != null ? `  \u25C6  about ${Math.round(perHour * 60).toLocaleString()} requests an hour` : ''));
+  document.getElementById('clients-note').hidden = !d.redacted;
 
   if (d.visitors) {
     setText('visitor-current', d.visitors.current);
@@ -887,13 +909,31 @@ function generateFunFact(d) {
 }
 
 // ============================================================================
+// Colours. The page's colours are CSS variables (they change with the light
+// and dark themes); drawings read them from there instead of hard-coding them.
+// ============================================================================
+function palette() {
+  const css = window.getComputedStyle ? getComputedStyle(document.documentElement) : null;
+  const v = (name, fallback) => {
+    const value = css && css.getPropertyValue(name);
+    return value && String(value).trim() ? String(value).trim() : fallback;
+  };
+  return {
+    cyan: v('--cyan', '#00d4ff'), green: v('--green', '#00ff88'), amber: v('--amber', '#ffaa00'),
+    red: v('--red', '#ff3355'), yellow: v('--yellow', '#ffd700'), magenta: v('--magenta', '#ff00ff'),
+    text: v('--text', '#c0d0e0'), muted: v('--muted', '#7f93b2'), grid: v('--grid', 'rgba(45,74,120,0.35)'),
+  };
+}
+
+// ============================================================================
 // History charts: /api/history returns averages over equal time buckets; the
 // charts are drawn as plain SVG so the page needs no chart library.
 // ============================================================================
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const HISTORY_REFRESH_MS = 5 * 60 * 1000;
-const HEALTH_COLORS = ['#00ff88', '#ffd700', '#ff3355'];   // OK, DEGRADED, FAULT
 let historyRange = '24h';
+// What each chart last drew, for the crosshair readout: id -> {series, times}.
+const chartData = {};
 
 function svgEl(name, attrs) {
   const el = document.createElementNS(SVG_NS, name);
@@ -945,26 +985,40 @@ function lastValue(values) {
   return null;
 }
 
+// Index of the first bucket where any of the lists has a value, or -1.
+function firstDataIndex(lists) {
+  let first = -1;
+  for (const values of lists) {
+    const i = values.findIndex(v => v != null);
+    if (i >= 0 && (first < 0 || i < first)) first = i;
+  }
+  return first;
+}
+
 // Draw a chart of up to a few series. Each series: {values, color, label,
 // format, axis, robust, minSpan}. Series on the same axis ('left' or 'right')
 // share a scale; `robust` scales that axis to the 2nd-98th percentile, and
-// `minSpan` is the least range of values the axis covers.
-function drawHistoryChart(id, series) {
+// `minSpan` is the least range of values the axis covers. The top and bottom
+// of each axis are labelled; `times` (epoch seconds per bucket) feed the
+// crosshair readout.
+function drawHistoryChart(id, series, times) {
   const svg = document.getElementById(id);
   while (svg.firstChild) svg.removeChild(svg.firstChild);
   const rect = svg.getBoundingClientRect();
   const w = rect.width || 600;
   const h = rect.height || 120;
-  const pad = 6;
+  const pad = 8;
+  const colours = palette();
   svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
   for (let i = 1; i < 4; i++) {
     const y = pad + (h - 2 * pad) * i / 4;
     svg.appendChild(svgEl('line', { x1: 0, x2: w, y1: y, y2: y,
-      stroke: 'rgba(45,74,120,0.3)', 'stroke-dasharray': '2,3' }));
+      stroke: colours.grid, 'stroke-dasharray': '2,3' }));
   }
   const legend = document.getElementById(id + '-legend');
   legend.textContent = '';
   let drew = false;
+  const described = [];
   for (const axis of ['left', 'right']) {
     const group = series.filter(s => (s.axis || 'left') === axis);
     const range = seriesRange(group.map(s => s.values), group.some(s => s.robust));
@@ -982,6 +1036,14 @@ function drawHistoryChart(id, series) {
         fill: 'none', stroke: s.color, 'stroke-width': 1.4, 'vector-effect': 'non-scaling-stroke' }));
       drew = true;
     }
+    // Value labels at the top and bottom of this axis, in its first series' units.
+    const fmt = group[0].format;
+    const anchor = axis === 'left' ? 'start' : 'end';
+    const x = axis === 'left' ? 3 : w - 3;
+    for (const [value, y] of [[range[1], pad + 9], [range[0], h - pad - 2]]) {
+      svg.appendChild(svgEl('text', { x, y, 'text-anchor': anchor, class: 'axis-label',
+        fill: group.length === 1 ? group[0].color : colours.muted })).textContent = fmt(value);
+    }
   }
   for (const s of series) {
     const item = document.createElement('span');
@@ -995,34 +1057,44 @@ function drawHistoryChart(id, series) {
       `${s.label} ${now == null ? '—' : s.format(now)}` +
       (range ? ` (${s.format(range[0])} – ${s.format(range[1])})` : '')));
     legend.appendChild(item);
+    if (now != null) described.push(`${s.label} now ${s.format(now)}`);
   }
   if (!drew) {
     svg.appendChild(svgEl('text', { x: '50%', y: '50%', 'text-anchor': 'middle',
-      fill: '#7f93b2', 'font-size': 10, 'font-family': 'Space Mono' }))
+      fill: colours.muted, class: 'axis-label' }))
       .textContent = 'NO DATA YET - one sample is recorded each minute';
   }
+  const title = (svg.closest('.history-panel') || {}).querySelector;
+  const name = title ? svg.closest('.history-panel').querySelector('.history-title').textContent : id;
+  svg.setAttribute('aria-label', `${name} chart. ${described.join('; ') || 'No data yet'}.`);
+  chartData[id] = { series, times: times || [] };
 }
 
 // Health as a coloured band: one block per bucket, empty where nothing was recorded.
-function drawHealthBand(id, values) {
+function drawHealthBand(id, values, times) {
   const svg = document.getElementById(id);
   while (svg.firstChild) svg.removeChild(svg.firstChild);
   const rect = svg.getBoundingClientRect();
   const w = rect.width || 600;
   const h = rect.height || 22;
+  const colours = palette();
+  const healthColours = [colours.green, colours.yellow, colours.red];   // OK, DEGRADED, FAULT
   svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
-  const bw = w / values.length;
+  const bw = w / Math.max(1, values.length);
   const time = [0, 0, 0];
   values.forEach((v, i) => {
     if (v == null) return;
     time[v] += 1;
     svg.appendChild(svgEl('rect', { x: (i * bw).toFixed(2), y: 0,
-      width: (bw + 0.6).toFixed(2), height: h, fill: HEALTH_COLORS[v], opacity: 0.75 }));
+      width: (bw + 0.6).toFixed(2), height: h, fill: healthColours[v], opacity: 0.75 }));
   });
   const recorded = time[0] + time[1] + time[2];
   const legend = document.getElementById(id + '-legend');
   legend.textContent = recorded === 0 ? 'no data yet' : ['OK', 'DEGRADED', 'FAULT']
     .map((name, i) => `${name} ${Math.round(100 * time[i] / recorded)}%`).join('  ◆  ');
+  svg.setAttribute('aria-label', `Health over time: ${legend.textContent}`);
+  const names = ['OK', 'DEGRADED', 'FAULT'];
+  chartData[id] = { series: [{ values, label: 'health', format: v => names[v] || '—' }], times: times || [] };
 }
 
 function renderSummary(sum, range) {
@@ -1035,13 +1107,16 @@ function renderSummary(sum, range) {
   strong.className = cls;
   strong.textContent = `On GPS ${pct.toFixed(pct >= 99.95 || pct < 10 ? 1 : 2)}%`;
   el.appendChild(strong);
+  el.appendChild(document.createTextNode('  ◆  ' + outagesText(sum, range)));
+}
+
+function outagesText(sum, range) {
   const rest = [];
   rest.push(sum.outages === 0 ? 'no outages'
     : `${sum.outages} outage${sum.outages === 1 ? '' : 's'}, longest ${formatDuration(sum.longest_outage_s)}`);
   if (sum.ongoing_outage_since != null) rest.push('one is ongoing');
-  const recorded = sum.minutes_recorded * 60;
-  rest.push(`over ${formatDuration(recorded)} recorded in the last ${range}`);
-  el.appendChild(document.createTextNode('  \u25C6  ' + rest.join('  \u25C6  ')));
+  if (range) rest.push(`over ${formatDuration(sum.minutes_recorded * 60)} recorded in the last ${range}`);
+  return rest.join('  ◆  ');
 }
 
 // Daily frequency at a fixed temperature: what is left moves only as the
@@ -1049,53 +1124,86 @@ function renderSummary(sum, range) {
 function renderAgeing(a) {
   const daily = (a && a.daily) || [];
   drawHistoryChart('hist-ageing', [
-    { values: daily.map(d => d[1]), color: '#ff00ff', label: `at ${a ? a.reference_c : 40} \u00b0C`,
+    { values: daily.map(d => d[1]), color: palette().magenta, label: `at ${a ? a.reference_c : 40} °C`,
       format: v => v.toFixed(3) + ' ppm', minSpan: 0.05 },
-  ]);
+  ], daily.map(d => d[0]));
   const legend = document.getElementById('hist-ageing-legend');
   const note = document.createElement('span');
   if (!a || daily.length < 3) {
     note.textContent = `needs 3 days on GPS (${daily.length} so far)`;
   } else {
     note.textContent = `trend ${a.trend_ppm_per_month >= 0 ? '+' : ''}${a.trend_ppm_per_month.toFixed(3)} ppm/month` +
-      `  \u25C6  temperature effect ${a.temp_coeff_ppm_per_c.toFixed(3)} ppm/\u00b0C`;
+      `  ◆  temperature effect ${a.temp_coeff_ppm_per_c.toFixed(3)} ppm/°C`;
   }
   legend.appendChild(note);
 }
 
-function rangeLabel(seconds) {
-  return seconds >= 86400 ? `${Math.round(seconds / 86400)} d ago` : `${Math.round(seconds / 3600)} h ago`;
+// Time labels for the x axis, in the server's zone: clock times for a day or
+// less, dates for longer.
+function timeLabel(epochSeconds, spanSeconds) {
+  const d = new Date(epochSeconds * 1000);
+  const opts = spanSeconds <= 2 * 86400
+    ? { timeZone: SERVER_TZ, hour: '2-digit', minute: '2-digit', hour12: false }
+    : { timeZone: SERVER_TZ, month: 'short', day: 'numeric' };
+  return new Intl.DateTimeFormat('en-US', opts).format(d);
+}
+
+function renderTimeAxis(times) {
+  const axis = document.getElementById('hist-axis');
+  axis.textContent = '';
+  if (times.length < 2) return;
+  const span = times[times.length - 1] - times[0];
+  // Up to five labels, without repeats when there are only a few points.
+  const shown = [];
+  for (let k = 0; k <= 4; k++) {
+    const text = timeLabel(times[Math.round(k * (times.length - 1) / 4)], span);
+    if (shown[shown.length - 1] !== text) shown.push(text);
+  }
+  for (const text of shown) {
+    const label = document.createElement('span');
+    label.textContent = text;
+    axis.appendChild(label);
+  }
 }
 
 function renderHistory(h) {
   const f = h.fields;
+  const colours = palette();
+  // While the history is shorter than the range, start the charts at the
+  // first sample instead of squeezing everything into the right-hand edge.
+  const names = Object.keys(f);
+  const first = Math.max(0, firstDataIndex(names.map(n => f[n])));
+  const cut = values => (values || []).slice(first);
+  const times = cut(f.health.map((_, i) => h.start + (i + 0.5) * h.step));
   const ns = v => formatSecondsAsHuman(v);
   drawHistoryChart('hist-offset', [
-    { values: f.pps_offset_s, color: '#00d4ff', label: 'PPS', format: ns, robust: true },
-    { values: f.last_offset_s, color: '#ffaa00', label: 'clock correction', format: ns,
+    { values: cut(f.pps_offset_s), color: colours.cyan, label: 'PPS', format: ns, robust: true },
+    { values: cut(f.last_offset_s), color: colours.amber, label: 'clock correction', format: ns,
       axis: 'right', robust: true },
-  ]);
+  ], times);
   drawHistoryChart('hist-freq', [
-    { values: f.frequency_ppm, color: '#00ff88', label: 'frequency', format: v => v.toFixed(3) + ' ppm' },
-    { values: f.temperature_c, color: '#ffaa00', label: 'CPU', format: v => v.toFixed(1) + ' °C', axis: 'right' },
-  ]);
+    { values: cut(f.frequency_ppm), color: colours.green, label: 'frequency', format: v => v.toFixed(3) + ' ppm' },
+    { values: cut(f.temperature_c), color: colours.amber, label: 'CPU', format: v => v.toFixed(1) + ' °C', axis: 'right' },
+  ], times);
   drawHistoryChart('hist-gps', [
-    { values: f.sats_used, color: '#00ff88', label: 'satellites used', format: v => v.toFixed(1) },
-    { values: f.best_snr, color: '#00d4ff', label: 'best signal', format: v => v.toFixed(0) + ' dB-Hz', axis: 'right' },
-  ]);
+    { values: cut(f.sats_used), color: colours.green, label: 'satellites used', format: v => v.toFixed(1) },
+    { values: cut(f.best_snr), color: colours.cyan, label: 'best signal', format: v => v.toFixed(0) + ' dB-Hz', axis: 'right' },
+  ], times);
   // Traffic: the history stores counts per minute; show them per hour.
-  const perHour = values => values.map(v => (v == null ? null : v * 60));
+  const perHour = values => cut(values).map(v => (v == null ? null : v * 60));
   const count = v => Math.round(v).toLocaleString() + '/h';
   drawHistoryChart('hist-traffic', [
-    { values: perHour(f.ntp_requests || []), color: '#00d4ff', label: 'requests', format: count },
-    { values: perHour(f.nts_requests || []), color: '#00ff88', label: 'NTS', format: count },
-    { values: perHour(f.ntp_dropped || []), color: '#ff3355', label: 'dropped', format: count },
-  ]);
+    { values: perHour(f.ntp_requests), color: colours.cyan, label: 'requests', format: count },
+    { values: perHour(f.nts_requests), color: colours.green, label: 'NTS', format: count },
+    { values: perHour(f.ntp_dropped), color: colours.red, label: 'dropped', format: count },
+  ], times);
   renderAgeing(h.ageing);
-  drawHealthBand('hist-health', f.health);
+  drawHealthBand('hist-health', cut(f.health), times);
   renderSummary(h.summary, h.range);
-  setText('hist-start', rangeLabel(h.step * f.health.length));
-  setText('hist-note', `${h.range} ◆ averages over ${formatDuration(h.step)} each`);
+  renderTimeAxis(times);
+  const shown = times.length * h.step;
+  setText('hist-note', `${first > 0 ? `${formatDuration(shown)} recorded so far, of ` : ''}${h.range}` +
+    `  ◆  each point averages ${formatDuration(h.step)}  ◆  point at a chart for values`);
 }
 
 async function fetchHistory() {
@@ -1103,21 +1211,310 @@ async function fetchHistory() {
     const res = await fetch('/api/history?range=' + encodeURIComponent(historyRange),
                             { cache: 'no-store' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    renderHistory(await res.json());
+    const h = await res.json();
+    lastHistory = h;
+    renderHistory(h);
+    if (h.range === '24h') updateGpsTile(h.summary);
   } catch (e) {
     setText('hist-note', 'history unavailable');
     console.error(e);
   }
 }
+let lastHistory = null;
+
+// The "On GPS (24 h)" tile always uses the last 24 hours, whatever range the
+// charts show.
+async function fetchDaySummary() {
+  if (historyRange === '24h') return;   // fetchHistory already covers it
+  try {
+    const res = await fetch('/api/history?range=24h', { cache: 'no-store' });
+    if (res.ok) updateGpsTile((await res.json()).summary);
+  } catch (e) { /* the tile keeps its last value */ }
+}
+
+function updateGpsTile(sum) {
+  const el = document.getElementById('sum-ongps');
+  if (!el) return;
+  if (!sum || sum.on_gps_pct == null) {
+    el.textContent = '—';
+    setText('sum-outages', 'no history yet');
+    return;
+  }
+  const pct = sum.on_gps_pct;
+  el.textContent = `${pct.toFixed(pct >= 99.95 || pct < 10 ? 1 : 2)}%`;
+  el.classList.remove('good', 'accent', 'bad');
+  el.classList.add(pct >= 99.9 ? 'good' : pct >= 99 ? 'accent' : 'bad');
+  setText('sum-outages', outagesText(sum, null));
+}
 
 document.querySelectorAll('#history-range button').forEach(button => {
   button.addEventListener('click', () => {
     historyRange = button.dataset.range;
-    document.querySelectorAll('#history-range button')
-      .forEach(b => b.classList.toggle('active', b === button));
+    document.querySelectorAll('#history-range button').forEach(b => {
+      b.classList.toggle('active', b === button);
+      b.setAttribute('aria-pressed', b === button ? 'true' : 'false');
+    });
     fetchHistory();
   });
 });
+
+// Crosshair: pointing at any history chart shows the time and that chart's
+// values there.
+function chartReadout(id, fraction) {
+  const data = chartData[id];
+  if (!data) return null;
+  const n = Math.max(...data.series.map(s => s.values.length), 0);
+  if (n === 0) return null;
+  const i = Math.min(n - 1, Math.max(0, Math.round(fraction * (n - 1))));
+  const lines = data.series.map(s => `${s.label}: ${s.values[i] == null ? '—' : s.format(s.values[i])}`);
+  const t = data.times[i];
+  const when = t != null ? new Intl.DateTimeFormat('en-US', {
+    timeZone: SERVER_TZ, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(new Date(t * 1000)) : '';
+  return { index: i, text: [when].concat(lines).filter(Boolean).join('\n') };
+}
+
+document.querySelectorAll('.chart-box').forEach(box => {
+  const svg = box.querySelector('svg');
+  const line = document.createElement('div');
+  line.className = 'crosshair';
+  const tip = document.createElement('div');
+  tip.className = 'chart-tip';
+  box.appendChild(line);
+  box.appendChild(tip);
+  const hide = () => { line.style.display = 'none'; tip.style.display = 'none'; };
+  box.addEventListener('mouseleave', hide);
+  box.addEventListener('mousemove', ev => {
+    const r = box.getBoundingClientRect();
+    const fraction = (ev.clientX - r.left) / r.width;
+    const out = chartReadout(svg.id, fraction);
+    if (!out) { hide(); return; }
+    line.style.display = 'block';
+    line.style.left = `${fraction * 100}%`;
+    tip.style.display = 'block';
+    tip.textContent = out.text;
+    tip.style.left = fraction > 0.6 ? '' : `${fraction * 100 + 2}%`;
+    tip.style.right = fraction > 0.6 ? `${(1 - fraction) * 100 + 2}%` : '';
+  });
+});
+
+// ============================================================================
+// Signal bars: one per satellite, sorted by number, height for signal strength.
+// ============================================================================
+function satBarsHtml(satellites) {
+  if (!satellites || satellites.length === 0) return '<div class="empty">no satellites listed</div>';
+  return satellites.slice().sort((a, b) => (a.prn || 0) - (b.prn || 0)).map(s => {
+    const ss = Math.max(0, s.ss || 0);
+    const pct = Math.min(100, (ss / 50) * 100);
+    const cls = s.used ? 'used' : ss >= 25 ? 'heard' : ss > 0 ? 'weak' : 'silent';
+    return `<div class="sat-bar ${cls}" title="Satellite ${esc(s.prn)}: ${ss ? ss + ' dB-Hz' : 'no signal'}${s.used ? ', used in the fix' : ''}">` +
+      `<div class="sat-fill" style="height:${pct.toFixed(0)}%"></div>` +
+      `<div class="sat-ss">${ss ? Math.round(ss) : ''}</div><div class="sat-prn">${esc(s.prn)}</div></div>`;
+  }).join('');
+}
+
+function renderSatBars(satellites) {
+  const el = document.getElementById('sat-bars');
+  if (!el) return;
+  el.innerHTML = satBarsHtml(satellites);
+  const heard = (satellites || []).filter(s => (s.ss || 0) > 0).length;
+  el.setAttribute('aria-label', `${heard} of ${(satellites || []).length} satellites have a signal`);
+}
+
+// ============================================================================
+// Sky visibility map, from /api/skymap: where satellites are heard over days.
+// ============================================================================
+const SKYMAP_REFRESH_MS = 10 * 60 * 1000;
+let lastSkymap = null;
+
+// A cell's verdict: blocked (passed through but rarely heard), weak, good,
+// or too few passes to tell.
+function skyCellClass(cell) {
+  if (cell.passes < 30) return 'unknown';
+  if (cell.heard_pct < 20) return 'blocked';
+  if ((cell.mean_snr || 0) < 25) return 'weak';
+  return 'good';
+}
+
+// Compass directions (8 sectors) where most of the low sky (10-45 degrees
+// up) is blocked: walls, roofs and windows block an antenna's view low down
+// first. Below 10 degrees satellites are often lost anyway.
+function blockedDirections(cells) {
+  const names = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  const tally = names.map(() => ({ blocked: 0, known: 0 }));
+  for (const c of cells) {
+    if (c.el < 10 || c.el >= 45) continue;
+    const verdict = skyCellClass(c);
+    if (verdict === 'unknown') continue;
+    const sector = Math.round(((c.az + 5) % 360) / 45) % 8;
+    tally[sector].known += 1;
+    if (verdict === 'blocked') tally[sector].blocked += 1;
+  }
+  return names.filter((_, i) => tally[i].known >= 2 && tally[i].blocked / tally[i].known >= 0.5);
+}
+
+function drawSkymap(map) {
+  const canvas2 = document.getElementById('skymap-canvas');
+  if (!canvas2 || !map) return;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas2.getBoundingClientRect();
+  const w = rect.width || 300;
+  const h = rect.height || 300;
+  if (canvas2.width !== Math.round(w * dpr)) { canvas2.width = Math.round(w * dpr); canvas2.height = Math.round(h * dpr); }
+  const g = canvas2.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const colours = palette();
+  const cx = w / 2;
+  const cy = h / 2;
+  const r = Math.min(w, h) / 2 - 22;
+  if (r <= 0) return;
+  const fill = { good: colours.green, weak: colours.amber, blocked: colours.red, unknown: colours.muted };
+  const alpha = { good: 0.55, weak: 0.5, blocked: 0.55, unknown: 0.15 };
+  // Azimuth 0 is north, clockwise; canvas angles start east, so shift by 90.
+  for (const c of map.cells) {
+    const verdict = skyCellClass(c);
+    const outer = r * (1 - c.el / 90);
+    const inner = r * (1 - Math.min(90, c.el + map.el_step) / 90);
+    const a0 = (c.az - 90) * Math.PI / 180;
+    const a1 = (c.az + map.az_step - 90) * Math.PI / 180;
+    g.beginPath();
+    g.arc(cx, cy, outer, a0, a1);
+    g.arc(cx, cy, Math.max(0, inner), a1, a0, true);
+    g.closePath();
+    g.globalAlpha = alpha[verdict];
+    g.fillStyle = fill[verdict];
+    g.fill();
+  }
+  g.globalAlpha = 1;
+  g.strokeStyle = colours.grid;
+  g.lineWidth = 1;
+  for (const elev of [0, 30, 60]) {
+    g.beginPath();
+    g.arc(cx, cy, r * (1 - elev / 90), 0, 2 * Math.PI);
+    g.stroke();
+  }
+  g.fillStyle = colours.cyan;
+  g.font = "bold 11px 'Orbitron', sans-serif";
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText('N', cx, cy - r - 11);
+  g.fillText('S', cx, cy + r + 11);
+  g.fillText('E', cx + r + 11, cy);
+  g.fillText('W', cx - r - 11, cy);
+
+  const legend = document.getElementById('skymap-legend');
+  legend.textContent = '';
+  for (const [cls, label] of [['good', 'heard well'], ['weak', 'weak'], ['blocked', 'blocked'], ['unknown', 'not enough passes yet']]) {
+    const item = document.createElement('span');
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = fill[cls];
+    item.appendChild(swatch);
+    item.appendChild(document.createTextNode(label));
+    legend.appendChild(item);
+  }
+  const blocked = blockedDirections(map.cells);
+  const note = document.createElement('span');
+  note.textContent = map.cells.length === 0 ? 'collecting: satellites are counted once a minute'
+    : blocked.length ? `mostly blocked towards ${blocked.join(', ')}` : 'no blocked direction found';
+  legend.appendChild(note);
+  canvas2.setAttribute('aria-label', `Sky visibility map: ${note.textContent}`);
+}
+
+async function fetchSkymap() {
+  try {
+    const res = await fetch('/api/skymap', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    lastSkymap = await res.json();
+    drawSkymap(lastSkymap);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+// ============================================================================
+// Offsets as a picture: where each source puts the time, on a scale that is
+// even in powers of ten (1 ns ... 100 ms each side), with its error margin.
+// ============================================================================
+function offsetPosition(seconds) {
+  const lo = 1e-9;
+  const decades = 8;   // 1 ns to 100 ms
+  const size = Math.min(decades, Math.max(0, Math.log10(Math.max(Math.abs(seconds), lo) / lo)));
+  return 50 + Math.sign(seconds) * (size / decades) * 50;   // percent across the bar
+}
+
+function offsetBar(offset, error) {
+  if (typeof offset !== 'number') return '';
+  const x = offsetPosition(offset);
+  const lo = typeof error === 'number' ? offsetPosition(offset - error) : x;
+  const hi = typeof error === 'number' ? offsetPosition(offset + error) : x;
+  const size = Math.abs(offset);
+  const cls = size < 1e-5 ? 'good' : size < 1e-3 ? 'accent' : 'bad';
+  return `<svg class="offset-bar" viewBox="0 0 100 12" preserveAspectRatio="none" aria-hidden="true">` +
+    `<line class="zero" x1="50" x2="50" y1="0" y2="12"></line>` +
+    `<line class="margin" x1="${Math.min(lo, hi).toFixed(1)}" x2="${Math.max(lo, hi).toFixed(1)}" y1="6" y2="6"></line>` +
+    `<circle class="dot ${cls}" cx="${x.toFixed(1)}" cy="6" r="2.6"></circle></svg>`;
+}
+
+// ============================================================================
+// Clients: a one-line summary, and the list sorted by most recent request.
+// ============================================================================
+function clientsView(clients) {
+  const real = (clients || []).filter(c => c.host !== '127.0.0.1' && c.host !== '::1');
+  const sorted = real.slice().sort((a, b) => (a.last_s == null ? Infinity : a.last_s) - (b.last_s == null ? Infinity : b.last_s));
+  const recent = real.filter(c => c.last_s != null && c.last_s < 3600).length;
+  return { sorted, total: real.length, recent };
+}
+
+// ============================================================================
+// The browser tab: a coloured dot and the status in the title, so the
+// server's state shows from another tab.
+// ============================================================================
+let lastTabStatus = null;
+function updateTabStatus(status, host) {
+  const label = status || 'NO LINK';
+  if (label === lastTabStatus) return;
+  lastTabStatus = label;
+  document.title = `● ${label} · ${host || 'Time Server'}`;
+  const colours = palette();
+  const colour = label === 'OK' ? colours.green : label === 'DEGRADED' ? colours.amber : colours.red;
+  try {
+    const c = document.createElement('canvas');
+    c.width = 32;
+    c.height = 32;
+    const g = c.getContext('2d');
+    g.fillStyle = colour;
+    g.beginPath();
+    g.arc(16, 16, 13, 0, 2 * Math.PI);
+    g.fill();
+    const link = document.getElementById('favicon');
+    if (link) link.href = c.toDataURL('image/png');
+  } catch (e) { /* no canvas: the title still says it */ }
+}
+
+// ============================================================================
+// Wall display (?display): only the clock, the status and the key numbers.
+// ============================================================================
+const DISPLAY_MODE = new URLSearchParams(window.location ? window.location.search : '').has('display');
+if (DISPLAY_MODE && document.body.classList) document.body.classList.add('display-mode');
+
+// Open/closed state of the collapsible sections, remembered per browser.
+document.querySelectorAll('details.collapsible').forEach(d => {
+  const key = 'details:' + d.id;
+  try { if (localStorage.getItem(key) === 'open') d.open = true; } catch (e) { /* private mode */ }
+  d.addEventListener('toggle', () => {
+    try { localStorage.setItem(key, d.open ? 'open' : 'closed'); } catch (e) { /* ignore */ }
+    if (d.open) { drawSkymap(lastSkymap); if (lastHistory) renderHistory(lastHistory); }
+  });
+});
+
+// Redraw drawings when the colour theme changes.
+if (window.matchMedia) {
+  const scheme = window.matchMedia('(prefers-color-scheme: light)');
+  const redraw = () => { lastTabStatus = null; drawSkymap(lastSkymap); if (lastHistory) renderHistory(lastHistory); };
+  if (scheme.addEventListener) scheme.addEventListener('change', redraw);
+}
 
 let prog = document.getElementById('refresh-progress');
 function startProgress() {
@@ -1324,17 +1721,16 @@ async function fetchData() {
     const res = await fetch('/api/status', { signal: abort.signal, cache: 'no-store' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
-    const wasHidden = document.getElementById('dashboard').style.display !== 'block';
-    document.getElementById('loading').style.display = 'none';
-    document.getElementById('dashboard').style.display = 'block';
-    if (wasHidden) { requestAnimationFrame(resizeCanvas); }
+    const first = document.body.classList.contains('loading');
+    document.body.classList.remove('loading');
+    if (first) { requestAnimationFrame(resizeCanvas); }
     linkLost = false;
     render(data);
     lastGoodAt = performance.now();
     attachTooltips();
   } catch (e) {
-    document.getElementById('loading').textContent = '\u2715 TELEMETRY LINK FAILED';
     showLinkLost();
+    updateTabStatus('NO LINK', document.getElementById('h-hostname').textContent);
     console.error(e);
   } finally {
     clearTimeout(timer);
@@ -1351,3 +1747,7 @@ fetchData();
 setInterval(fetchData, REFRESH_S * 1000);
 fetchHistory();
 setInterval(fetchHistory, HISTORY_REFRESH_MS);
+fetchDaySummary();
+setInterval(fetchDaySummary, HISTORY_REFRESH_MS);
+fetchSkymap();
+setInterval(fetchSkymap, SKYMAP_REFRESH_MS);
