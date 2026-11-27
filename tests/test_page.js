@@ -12,8 +12,21 @@ const vm = require('node:vm');
 
 const SOURCE = path.join(__dirname, '..', 'dashboard', 'static', 'dashboard.js');
 
+// A minimal classList, so class changes can be checked.
+function fakeClassList() {
+  const set = new Set();
+  return {
+    add: (...c) => c.forEach(x => set.add(x)),
+    remove: (...c) => c.forEach(x => set.delete(x)),
+    toggle: (c, on) => ((on === undefined ? !set.has(c) : on) ? set.add(c) : set.delete(c)),
+    contains: c => set.has(c),
+    toString: () => [...set].join(' '),
+  };
+}
+
 function standIn() {
   const target = function () { return standIn(); };
+  target.classList = fakeClassList();
   return new Proxy(target, {
     get(t, key) {
       if (key === Symbol.toPrimitive) return () => '';
@@ -134,16 +147,47 @@ test('usableTimeZone falls back to UTC for unknown zones', () => {
   assert.strictEqual(page.usableTimeZone('Not/AZone'), 'UTC');
 });
 
-test('offsets are coloured by size, from the number the server sends', () => {
+test('offsets are coloured by size and keep their own style', () => {
   const { page, elements } = loadPage();
   const cls = (seconds) => {
     page.colorizeOffset('text', seconds, 'offset-under-test');
-    return elements['offset-under-test'].className;
+    return String(elements['offset-under-test'].classList);
   };
-  assert.strictEqual(cls(1.24e-7), 'stat-val good');     // 124 ns
-  assert.strictEqual(cls(-5e-5), 'stat-val accent');     // 50 us, sign ignored
-  assert.strictEqual(cls(0.002), 'stat-val bad');        // 2 ms
+  elements['offset-under-test'] = undefined;
+  page.document.getElementById('offset-under-test').classList.add('val');   // the hero style
+  assert.strictEqual(cls(1.24e-7), 'val good');          // 124 ns
+  assert.strictEqual(cls(-5e-5), 'val accent');          // 50 us, sign ignored
+  assert.strictEqual(cls(0.002), 'val bad');             // 2 ms
   assert.strictEqual(elements['offset-under-test'].textContent, 'text');
+});
+
+test('device clock offset from round trips to the server', () => {
+  const { page } = loadPage();
+  // Device sends at 1000 ms and gets the answer at 1040 ms, so the server
+  // read its clock at device time 1020 ms. It read 2.520 s: the device is
+  // 1500 ms behind (slow).
+  const s = page.clockSample(1000, 1040, 2.52);
+  assert.strictEqual(Math.round(s.offsetMs), 1500);
+  assert.strictEqual(s.uncertaintyMs, 20);
+  const best = page.bestSample([{ offsetMs: 9, uncertaintyMs: 30 }, { offsetMs: 7, uncertaintyMs: 4 },
+                                { offsetMs: 8, uncertaintyMs: 12 }]);
+  assert.strictEqual(best.offsetMs, 7);
+  assert.strictEqual(page.bestSample([]), null);
+  assert.strictEqual(page.deviceOffsetText(1500, 20), 'your clock is 1.50 s slow (\u00b120 ms)');
+  assert.strictEqual(page.deviceOffsetText(-250, 10), 'your clock is 250 ms fast (\u00b120 ms)');
+  assert.strictEqual(page.deviceOffsetText(3, 12), 'your clock is right (to within 20 ms)');
+  assert.strictEqual(page.deviceOffsetText(-15, 2), 'your clock is right (to within 20 ms)');
+  assert.strictEqual(page.deviceOffsetText(null, null), 'could not compare with your clock');
+  assert.strictEqual(page.deviceOffsetText(-7260000, 30), 'your clock is 2h 1m 0s fast (\u00b130 ms)');
+});
+
+test('a selected source that stopped answering is shown as silent', () => {
+  const { page } = loadPage();
+  assert.strictEqual(page.displayState({ state: 'synced', reach: '0' }), 'silent');
+  assert.strictEqual(page.displayState({ state: 'synced', reach: '377' }), 'synced');
+  assert.strictEqual(page.displayState({ state: 'not combined', reach: '0' }), 'not combined');
+  assert.strictEqual(page.secondsText(2.16328e-4), '216.33 \u00b5s');
+  assert.strictEqual(page.secondsText(null, '0.1 seconds'), '0.1 seconds');
 });
 
 test('fun facts work from numbers and survive a missing offset', () => {

@@ -36,7 +36,7 @@ from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, UTC
 
 # Keep in step with the newest entry in CHANGELOG.md (a test checks it).
-__version__ = "2.2.1"
+__version__ = "2.3.0"
 
 log = logging.getLogger("chrony-dashboard")
 log.addHandler(logging.NullHandler())  # main() sets up real logging
@@ -1163,10 +1163,17 @@ class SyncTracker:
         self.since_exact = False
         self.last_on_gps = None
 
-    def note(self, tracking, refid, now=None):
-        """Record one snapshot's reference; returns the state for the page."""
+    def note(self, tracking, refid, sources=(), now=None):
+        """Record one snapshot's reference; returns the state for the page.
+
+        On GPS means chrony's reference is the PPS refclock and PPS is still
+        delivering samples: chrony goes on naming a refclock as its reference
+        for a while after its pulses stop.
+        """
         now = time.time() if now is None else now
-        on_gps = tracking.get("reference_id", "").endswith(f"({refid})")
+        pps = next((src for src in sources if src.get("name") == refid), None)
+        silent = pps is not None and pps.get("reach") in ("0", "")
+        on_gps = tracking.get("reference_id", "").endswith(f"({refid})") and not silent
         delay, dispersion = tracking.get("root_delay_s"), tracking.get("root_dispersion_s")
         with self._lock:
             if on_gps != self.on_gps:
@@ -1209,7 +1216,7 @@ def get_all_data():
     }
     futures = {name: _COLLECT_POOL.submit(fn) for name, fn in jobs.items()}
     data = {name: future.result() for name, future in futures.items()}
-    data["sync"] = SYNC.note(data["tracking"], CONFIG["pps_refid"])
+    data["sync"] = SYNC.note(data["tracking"], CONFIG["pps_refid"], data["sources"])
     data["health"] = compute_health(data["tracking"], data["sources"], data["gps"],
                                     data["expiries"])
     return data
@@ -1681,6 +1688,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001 - see above
                 log.exception("could not build the health report")
                 self.send_json({"status": "ERROR"}, status=500)
+        elif path == "/api/time":
+            # The server's clock, read as late as possible before answering,
+            # for the page to work out how far the viewer's clock is off.
+            self.send_json({"now": time.time()})
         elif path == "/api/history":
             name = parse_qs(url.query).get("range", ["24h"])[0]
             if name not in HISTORY_RANGES:

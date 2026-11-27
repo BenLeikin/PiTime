@@ -194,6 +194,9 @@ The service takes its site options from `DASHBOARD_OPTS` in
 - `GET /` serves the page; its stylesheet and script are under `/static/`.
 - `GET /api/status` returns the full JSON snapshot. One snapshot is shared by
   all viewers for `--cache-ttl` seconds.
+- `GET /api/time` returns the server's clock (`{"now": seconds}`), read as
+  late as possible; the page uses it to show the server's time and how far
+  the viewer's device clock is off.
 - `GET /api/health` returns `{"status": "OK"|"DEGRADED"|"FAULT", ...}` with
   the reasons and the dashboard's version. Add
   `?strict=1` to get HTTP 503 whenever the status is not `OK`, for monitors

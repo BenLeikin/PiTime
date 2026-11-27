@@ -583,6 +583,12 @@ class SyncTrackerTests(unittest.TestCase):
         self.assertAlmostEqual(lost["error_bound_s"], 0.013)   # 3 ms + 20 ms / 2
         self.assertEqual(sync.note(self.ON, "PPS", now=1200)["since"], 1200)
 
+    def test_selected_but_silent_pps_is_not_on_gps(self):
+        sync = cd.SyncTracker()
+        sync.note(self.ON, "PPS", [{"name": "PPS", "reach": "377"}], now=1000)
+        silent = sync.note(self.ON, "PPS", [{"name": "PPS", "reach": "0"}], now=1060)
+        self.assertEqual((silent["on_gps"], silent["last_on_gps"]), (False, 1000))
+
     def test_other_refclock_names_are_not_gps(self):
         self.assertFalse(cd.SyncTracker().note({"reference_id": "50505300 (PPSX)"}, "PPS")["on_gps"])
 
@@ -990,6 +996,14 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(json.loads(body)["range"], "7d")
             self.assertEqual(json.loads(body)["step"], 7 * 86400 / 360)
             self.assertEqual(self.get("/api/history?range=1y")[0], 400)
+
+    def test_time_endpoint(self):
+        before = time.time()
+        status, headers, body = self.get("/api/time")
+        now = json.loads(body)["now"]
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertTrue(before <= now <= time.time())
 
     def test_health_strict_mode_uses_the_http_status(self):
         status, _, body = self.get("/api/health")

@@ -2,6 +2,21 @@
 
 Notable changes to this project. Versions follow [semantic versioning](https://semver.org/): the major number changes when an upgrade needs action on an existing install.
 
+## [2.3.0] - 2026-11-26
+
+### Fixed
+
+- **Every clock on the page showed the viewer's own device time.** The header clock and the world clocks now show the server's time, measured from the browser the way an NTP client measures it (several quick requests to the new `/api/time`, keeping the shortest round trip), and the header says how far the viewer's device clock is off.
+- The GPS-lost banner did not appear while chrony still named a silent PPS as its reference, and the source table showed it as a green "synced". Both now treat a selected source with no recent samples as lost ("silent").
+- The frequency card was labelled "Clock Offset"; it is the crystal's rate error.
+- The offset card lost its large-number style whenever it was coloured.
+- Tooltips that described the wrong thing (uptime, altitude, last sample, the world clock) and "did you know" facts that were wrong or dated are corrected; the facts that use live numbers are only shown when those numbers mean something.
+
+### Changed
+
+- Readability: secondary text has at least 5.5:1 contrast (it was 2.9:1), nothing is smaller than 11 px, banner reasons are plain readable text, and times are shown in suitable units (216.33 µs rather than 0.000216328 seconds).
+- Motion: with "reduce motion" set on the viewer's system there is no radar sweep, easing or blinking, and the fault banner no longer flashes on and off for anyone; it glows slowly.
+
 ## [2.2.1] - 2026-11-26
 
 ### Security

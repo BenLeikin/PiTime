@@ -8,6 +8,7 @@
   --border-glow: #2d4a78;
   --cyan: #00d4ff;
   --cyan-dim: #007090;
+  --cyan-text: #2a9fc4;   /* cyan-dim is for borders; this is for text (6:1) */
   --amber: #ffaa00;
   --amber-dim: #8a5a00;
   --green: #00ff88;
@@ -16,7 +17,7 @@
   --yellow: #ffd700;
   --magenta: #ff00aa;
   --blue: #4488ff;
-  --muted: #4a6080;
+  --muted: #7f93b2;   /* 5.5:1 or better on every background: readable secondary text */
   --text: #c0d0e0;
   --heading: #e8f0ff;
   --display: 'Orbitron', 'Arial', sans-serif;
@@ -177,7 +178,7 @@ header::after {
 }
 .local-time-block .lt-label {
   font-family: var(--display);
-  font-size: 0.6rem;
+  font-size: 0.7rem;
   letter-spacing: 0.3em;
   color: var(--cyan);
   text-transform: uppercase;
@@ -201,7 +202,7 @@ header::after {
 }
 .local-time-block .lt-date {
   font-family: var(--mono);
-  font-size: 0.65rem;
+  font-size: 0.7rem;
   letter-spacing: 0.15em;
   color: var(--muted);
   text-transform: uppercase;
@@ -224,8 +225,8 @@ header::after {
   .mission-patch svg { width: 30px; height: 30px; }
   .header-text { grid-area: title; }
   .header-text h1 { font-size: 1.4rem; }
-  .header-text .designation { font-size: 0.6rem; letter-spacing: 0.25em; }
-  .header-text .subtitle { font-size: 0.6rem; letter-spacing: 0.12em; }
+  .header-text .designation { font-size: 0.7rem; letter-spacing: 0.25em; }
+  .header-text .subtitle { font-size: 0.7rem; letter-spacing: 0.12em; }
   .local-time-block {
     grid-area: clock;
     border-left: none;
@@ -307,7 +308,7 @@ header::after {
 .tip-pop .tip-title {
   display: block;
   font-family: var(--display);
-  font-size: 0.65rem;
+  font-size: 0.7rem;
   letter-spacing: 0.25em;
   color: var(--amber);
   text-transform: uppercase;
@@ -325,7 +326,7 @@ header::after {
   color: var(--muted);
   letter-spacing: 0.15em;
   text-transform: uppercase;
-  font-size: 0.6rem;
+  font-size: 0.7rem;
   text-align: right;
 }
 .header-meta dd {
@@ -341,7 +342,7 @@ header::after {
   padding: 0.2rem 0.5rem;
   border: 1px solid var(--green-dim);
   border-radius: 2px;
-  font-size: 0.6rem;
+  font-size: 0.7rem;
   letter-spacing: 0.2em;
   color: var(--green);
   text-transform: uppercase;
@@ -392,11 +393,12 @@ header::after {
 .banner.ok::before { background: var(--green); box-shadow: 0 0 16px var(--green); }
 .banner.degraded { color: var(--yellow); }
 .banner.degraded::before { background: var(--yellow); box-shadow: 0 0 16px var(--yellow); }
-.banner.fault { color: var(--red); animation: fault-flash 1s steps(2) infinite; }
+.banner.fault { color: var(--red); animation: fault-flash 2.4s ease-in-out infinite; }
 .banner.fault::before { background: var(--red); box-shadow: 0 0 16px var(--red); }
 @keyframes fault-flash {
-  0%   { background: var(--surface); }
-  50%  { background: rgba(255,51,85,0.1); }
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.65; }
+}
 }
 .banner .issues {
   font-family: var(--mono);
@@ -437,7 +439,7 @@ header::after {
   color: var(--cyan);
 }
 .skyview-header .legend {
-  font-size: 0.65rem;
+  font-size: 0.7rem;
   color: var(--muted);
   letter-spacing: 0.05em;
 }
@@ -523,7 +525,7 @@ header::after {
   align-items: center;
   gap: 0.5rem;
   font-family: var(--display);
-  font-size: 0.62rem;
+  font-size: 0.7rem;
   font-weight: 700;
   letter-spacing: 0.3em;
   text-transform: uppercase;
@@ -535,7 +537,7 @@ header::after {
 .card-title::before {
   content: '\25C6';
   color: var(--amber);
-  font-size: 0.6rem;
+  font-size: 0.7rem;
 }
 
 .stat-row {
@@ -567,7 +569,7 @@ header::after {
 }
 .hero-stat .lbl {
   font-family: var(--display);
-  font-size: 0.6rem;
+  font-size: 0.7rem;
   color: var(--muted);
   letter-spacing: 0.25em;
   text-transform: uppercase;
@@ -575,7 +577,7 @@ header::after {
 }
 .hero-stat .sub {
   font-size: 0.7rem;
-  color: var(--cyan-dim);
+  color: var(--cyan-text);
   margin-top: 0.15rem;
 }
 
@@ -656,7 +658,7 @@ header::after {
 }
 .tz-cell .city {
   font-family: var(--display);
-  font-size: 0.6rem;
+  font-size: 0.7rem;
   color: var(--muted);
   letter-spacing: 0.18em;
   text-transform: uppercase;
@@ -672,8 +674,8 @@ header::after {
   text-shadow: 0 0 12px rgba(0,212,255,0.4);
 }
 .tz-cell .date {
-  font-size: 0.62rem;
-  color: var(--cyan-dim);
+  font-size: 0.7rem;
+  color: var(--cyan-text);
   margin-top: 0.15rem;
   font-family: var(--mono);
 }
@@ -684,7 +686,7 @@ thead th {
   text-align: left;
   padding: 0.5rem 0.7rem;
   font-family: var(--display);
-  font-size: 0.6rem;
+  font-size: 0.7rem;
   letter-spacing: 0.2em;
   text-transform: uppercase;
   color: var(--cyan);
@@ -702,7 +704,7 @@ tbody td { padding: 0.5rem 0.7rem; color: var(--text); }
   display: inline-block;
   padding: 0.15rem 0.6rem;
   font-family: var(--display);
-  font-size: 0.6rem;
+  font-size: 0.7rem;
   font-weight: 700;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -740,7 +742,7 @@ tbody td { padding: 0.5rem 0.7rem; color: var(--text); }
 }
 .fun-fact .label {
   font-family: var(--display);
-  font-size: 0.6rem;
+  font-size: 0.7rem;
   font-weight: 700;
   letter-spacing: 0.25em;
   color: var(--amber);
@@ -781,7 +783,7 @@ footer {
   text-align: center;
   margin-top: 3rem;
   font-family: var(--display);
-  font-size: 0.65rem;
+  font-size: 0.7rem;
   color: var(--muted);
   letter-spacing: 0.3em;
   text-transform: uppercase;
@@ -809,19 +811,19 @@ footer {
 .history-head .card-title { margin-bottom: 0; }
 .range-buttons { display: flex; gap: 0.3rem; }
 .range-buttons button {
-  font-family: var(--display); font-size: 0.6rem; letter-spacing: 0.12em;
+  font-family: var(--display); font-size: 0.7rem; letter-spacing: 0.12em;
   color: var(--muted); background: transparent; border: 1px solid var(--border);
   padding: 0.25rem 0.6rem; cursor: pointer; border-radius: 2px;
 }
 .range-buttons button:hover { color: var(--cyan); border-color: var(--cyan-dim); }
 .range-buttons button.active { color: var(--cyan); border-color: var(--cyan); background: rgba(0,212,255,0.08); }
 .history-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 1rem 1.5rem; margin-top: 0.9rem; }
-.history-title { font-size: 0.62rem; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); margin-bottom: 0.3rem; }
+.history-title { font-size: 0.7rem; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); margin-bottom: 0.3rem; }
 .history-chart { width: 100%; height: 120px; display: block; }
 .history-band { width: 100%; height: 22px; display: block; }
-.history-legend { font-size: 0.62rem; color: var(--muted); margin-top: 0.3rem; display: flex; gap: 1rem; flex-wrap: wrap; }
+.history-legend { font-size: 0.7rem; color: var(--muted); margin-top: 0.3rem; display: flex; gap: 1rem; flex-wrap: wrap; }
 .history-legend .swatch { display: inline-block; width: 8px; height: 8px; margin-right: 0.35rem; vertical-align: middle; }
-.history-axis { display: flex; justify-content: space-between; font-size: 0.58rem; color: var(--muted); margin-top: 0.7rem; letter-spacing: 0.08em; }
+.history-axis { display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--muted); margin-top: 0.7rem; letter-spacing: 0.08em; }
 
 /* GPS lost: amber, between DEGRADED yellow and FAULT red. */
 .banner.holdover { color: var(--amber); }
@@ -843,4 +845,29 @@ footer {
   .skyview-header { flex-direction: column; align-items: flex-start; gap: 0.35rem; padding: 0.6rem 0.9rem 0.5rem; }
   .skyview-header .legend { flex-wrap: wrap; }
   .history-summary { line-height: 1.6; }
+}
+
+/* Your device's clock compared with the server's. */
+.local-time-block .lt-device { font-size: 0.72rem; color: var(--text); margin-top: 0.35rem; letter-spacing: 0.04em; }
+.local-time-block .lt-device.off { color: var(--amber); }
+/* Hero numbers: status colours only where they mean something. */
+.hero-stat .val.good { color: var(--green); text-shadow: 0 0 20px rgba(0,255,136,0.35); }
+.hero-stat .val.accent { color: var(--cyan); text-shadow: 0 0 20px rgba(0,212,255,0.35); }
+.hero-stat .val.bad { color: var(--red); text-shadow: 0 0 20px rgba(255,51,85,0.35); }
+.hero-stat .val.neutral { color: var(--text); text-shadow: none; }
+.state-silent { color: var(--amber); border-color: var(--amber); background: rgba(255,170,0,0.08); }
+
+/* People who ask their system for less motion get a still page. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* The reasons beside a banner: plain, readable text, not shouted. */
+.banner .issues {
+  font-family: var(--mono); font-weight: 400; text-transform: none;
+  letter-spacing: 0.02em; color: var(--text); font-size: 0.78rem;
 }

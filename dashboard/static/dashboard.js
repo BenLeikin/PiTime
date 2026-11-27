@@ -24,6 +24,12 @@ function esc(v) {
   })[c]);
 }
 
+// chrony keeps a source selected for a while after it stops answering; say
+// so instead of showing a healthy-looking "synced".
+function displayState(src) {
+  return src.state === 'synced' && (src.reach === '0' || src.reach === '') ? 'silent' : src.state;
+}
+
 function stateClass(state) { return 'state-' + (state || '').replace(/ /g, '-'); }
 
 function setText(id, val) {
@@ -40,8 +46,16 @@ function colorizeOffset(text, seconds, id) {
   el.textContent = text;
   if (typeof seconds === 'number') {
     const size = Math.abs(seconds);
-    el.className = 'stat-val ' + (size < 1e-5 ? 'good' : size < 1e-3 ? 'accent' : 'bad');
+    // Keep the element's own classes (the hero number's style); only the
+    // good / accent / bad colour changes.
+    el.classList.remove('good', 'accent', 'bad');
+    el.classList.add(size < 1e-5 ? 'good' : size < 1e-3 ? 'accent' : 'bad');
   }
+}
+
+// Seconds as chrony words them, in the unit that suits them: "216.33 µs".
+function secondsText(seconds, fallback) {
+  return typeof seconds === 'number' ? formatSecondsAsHuman(seconds) : (fallback || '\u2014');
 }
 
 function formatDuration(seconds) {
@@ -124,7 +138,7 @@ function drawSky() {
   ctx.arc(cx, cy, r, 0, 2 * Math.PI);
   ctx.fill();
 
-  if (typeof ctx.createConicGradient === 'function') {
+  if (!REDUCED_MOTION && typeof ctx.createConicGradient === 'function') {
     const sweepGrad = ctx.createConicGradient(radarAngle, cx, cy);
     sweepGrad.addColorStop(0, 'rgba(0,212,255,0.18)');
     sweepGrad.addColorStop(0.1, 'rgba(0,212,255,0.0)');
@@ -160,7 +174,7 @@ function drawSky() {
   ctx.fillText('E', cx + r + 12, cy);
   ctx.fillText('W', cx - r - 12, cy);
 
-  ctx.fillStyle = '#4a6080';
+  ctx.fillStyle = '#7f93b2';
   ctx.font = "9px 'Space Mono', monospace";
   ctx.fillText('30\u00b0', cx + 4, cy - r * 0.667 + 2);
   ctx.fillText('60\u00b0', cx + 4, cy - r * 0.333 + 2);
@@ -195,13 +209,13 @@ function drawSky() {
       ctx.moveTo(x, y + 9);  ctx.lineTo(x, y + 14);
       ctx.stroke();
     } else {
-      ctx.fillStyle = ss > 25 ? 'rgba(192,208,224,0.7)' : 'rgba(74,96,128,0.7)';
+      ctx.fillStyle = ss > 25 ? 'rgba(192,208,224,0.8)' : 'rgba(127,147,178,0.8)';
       ctx.beginPath();
       ctx.arc(x, y, 2.5, 0, 2 * Math.PI);
       ctx.fill();
     }
 
-    ctx.fillStyle = used ? '#00ff88' : 'rgba(74,96,128,0.8)';
+    ctx.fillStyle = used ? '#00ff88' : 'rgba(127,147,178,0.9)';
     ctx.font = "bold 10px 'Space Mono', monospace";
     ctx.fillText(sat.prn, x, y + (used ? 22 : 12));
   }
@@ -221,13 +235,16 @@ function drawSky() {
 
 // The sky changes slowly, so 20 frames a second is plenty; the sweep angle
 // follows the clock so its speed does not depend on the frame rate.
-const SKY_FRAME_MS = 50;
+// With "reduce motion" set, no radar sweep and no easing: redraw once a second.
+const REDUCED_MOTION = typeof window.matchMedia === 'function' &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const SKY_FRAME_MS = REDUCED_MOTION ? 1000 : 50;
 let lastSkyDraw = 0;
 function animateSats(now) {
   requestAnimationFrame(animateSats);
   if (now - lastSkyDraw < SKY_FRAME_MS) return;
   lastSkyDraw = now;
-  radarAngle = (now / 1000) * 0.72;
+  radarAngle = REDUCED_MOTION ? 0 : (now / 1000) * 0.72;
   for (let i = 0; i < satsAnimated.length; i++) {
     const sat = satsAnimated[i];
     const target = satsCurrent.find(s => s.prn === sat.prn);
@@ -240,8 +257,9 @@ function animateSats(now) {
         const dEl = target.el - sat.el;
         // Take the short way round the compass (359 -> 1 is +2, not -358).
         const dAz = ((target.az - sat.az + 540) % 360) - 180;
-        sat.el += dEl * 0.17;
-        sat.az = (sat.az + dAz * 0.17 + 360) % 360;
+        const step = REDUCED_MOTION ? 1 : 0.17;
+        sat.el += dEl * step;
+        sat.az = (sat.az + dAz * step + 360) % 360;
       }
       sat.ss = target.ss;
       sat.used = target.used;
@@ -271,7 +289,7 @@ function drawSparkline(values) {
     text.setAttribute('x', '50%');
     text.setAttribute('y', '50%');
     text.setAttribute('text-anchor', 'middle');
-    text.setAttribute('fill', '#4a6080');
+    text.setAttribute('fill', '#7f93b2');
     text.setAttribute('font-family', 'Space Mono');
     text.setAttribute('font-size', '10');
     text.textContent = 'COLLECTING - chrony makes one PPS sample every poll';
@@ -369,9 +387,89 @@ const TIMEZONES = [
   { city: 'UTC',         tz: 'UTC' },
 ];
 
+// ============================================================================
+// The server's time. Every clock on the page shows it, not the viewer's own
+// device clock (which may be wrong: that is why people run time servers).
+// A few quick requests to /api/time, keeping the one with the shortest round
+// trip, give the offset between the two clocks, good to about half that
+// round trip - the way an NTP client measures it.
+// ============================================================================
+const timeSync = { offsetMs: null, uncertaintyMs: null };
+const TIME_SYNC_SAMPLES = 5;
+const TIME_SYNC_EVERY_MS = 60 * 1000;
+const DEVICE_CLOCK_FLOOR_MS = 20;
+
+// One measurement from {sent, received} (device ms) and the server's time (s).
+function clockSample(sentMs, receivedMs, serverSeconds) {
+  const roundTrip = receivedMs - sentMs;
+  return { offsetMs: serverSeconds * 1000 - (sentMs + receivedMs) / 2,
+           uncertaintyMs: roundTrip / 2 };
+}
+
+// Of several measurements, the one with the shortest round trip.
+function bestSample(samples) {
+  return samples.reduce((best, s) => (best == null || s.uncertaintyMs < best.uncertaintyMs ? s : best), null);
+}
+
+async function syncWithServer() {
+  const samples = [];
+  for (let i = 0; i < TIME_SYNC_SAMPLES; i++) {
+    try {
+      // performance.now() times the round trip; Date.now() only anchors it.
+      const t0 = performance.now();
+      const wall0 = Date.now();
+      const res = await fetch('/api/time', { cache: 'no-store' });
+      const body = await res.json();
+      const t1 = performance.now();
+      if (res.ok && typeof body.now === 'number') {
+        samples.push(clockSample(wall0, wall0 + (t1 - t0), body.now));
+      }
+    } catch (e) { /* skip this one */ }
+  }
+  const best = bestSample(samples);
+  if (best) {
+    timeSync.offsetMs = best.offsetMs;
+    timeSync.uncertaintyMs = best.uncertaintyMs;
+  }
+  showDeviceOffset();
+}
+
+// Server time as a Date: the device clock corrected by the measured offset.
+function serverNow() {
+  return new Date(Date.now() + (timeSync.offsetMs || 0));
+}
+
+function describeMs(ms) {
+  const a = Math.abs(ms);
+  if (a < 1000) return `${Math.round(a)} ms`;
+  if (a < 120000) return `${(a / 1000).toFixed(a < 10000 ? 2 : 1)} s`;
+  return formatDuration(a / 1000);
+}
+
+// "Your device is 1.23 s fast" - or in sync, when the difference is within
+// what the measurement can tell.
+function deviceOffsetText(offsetMs, uncertaintyMs) {
+  if (offsetMs == null) return 'could not compare with your clock';
+  // Browsers round their clocks and timers (some by up to 100 ms for
+  // privacy), so differences under 20 ms are not worth reporting.
+  const margin = Math.max(uncertaintyMs, DEVICE_CLOCK_FLOOR_MS);
+  if (Math.abs(offsetMs) <= margin) return `your clock is right (to within ${describeMs(margin)})`;
+  // offsetMs is server minus device: positive means the device is behind.
+  return `your clock is ${describeMs(offsetMs)} ${offsetMs > 0 ? 'slow' : 'fast'} (\u00b1${describeMs(margin)})`;
+}
+
+function showDeviceOffset() {
+  const el = document.getElementById('lt-device');
+  if (!el) return;
+  el.textContent = deviceOffsetText(timeSync.offsetMs, timeSync.uncertaintyMs);
+  const wrong = timeSync.offsetMs != null &&
+    Math.abs(timeSync.offsetMs) > Math.max(timeSync.uncertaintyMs, DEVICE_CLOCK_FLOOR_MS) + 500;
+  el.className = 'lt-device' + (wrong ? ' off' : '');
+}
+
 function updateWorldClock() {
   const wc = document.getElementById('world-clock');
-  const now = new Date();
+  const now = serverNow();
   wc.innerHTML = TIMEZONES.map(t => {
     const time = now.toLocaleTimeString('en-US', { timeZone: t.tz, hour12: false });
     const date = now.toLocaleDateString('en-US', { timeZone: t.tz, month: 'short', day: 'numeric' });
@@ -433,7 +531,7 @@ function _ltGetAbbrev(d) {
   document.getElementById('lt-name').textContent = name;
 })();
 function updateHeaderClock() {
-  const now = new Date();
+  const now = serverNow();
   // toLocaleTimeString with fractionalSecondDigits respects the timezone correctly,
   // and we render hh:mm:ss separately from ms to keep the ms in its own color.
   const hms = _ltHmsFmt.format(now).replace(/^24/, '00'); // normalize midnight
@@ -549,8 +647,8 @@ function render(d) {
   tx.textContent = health.status === 'FAULT' ? 'NOT SYNCED' : 'TRANSMITTING';
   tx.classList.toggle('down', health.status === 'FAULT');
 
-  colorizeOffset(t.last_offset, t.last_offset_s, 'h-sys-offset');
-  setText('h-rms-offset', 'RMS ' + t.rms_offset);
+  colorizeOffset(secondsText(t.last_offset_s, t.last_offset), t.last_offset_s, 'h-sys-offset');
+  setText('h-rms-offset', 'RMS ' + secondsText(t.rms_offset_s, t.rms_offset).replace(/^-/, ''));
   setText('h-stratum', t.stratum);
   setText('h-leap', 'Leap ' + t.leap_status);
   setText('h-freq', t.freq_error);
@@ -558,9 +656,10 @@ function render(d) {
 
   setText('t-refid', t.reference_id);
   setText('t-reftime', t.ref_time);
-  setText('t-interval', t.update_interval);
-  setText('t-rootdelay', t.root_delay);
-  setText('t-rootdisp', t.root_dispersion);
+  setText('t-interval', typeof t.update_interval_s === 'number'
+    ? `${t.update_interval_s.toFixed(1)} s` : t.update_interval);
+  setText('t-rootdelay', secondsText(t.root_delay_s, t.root_delay));
+  setText('t-rootdisp', secondsText(t.root_dispersion_s, t.root_dispersion));
   setText('t-residfreq', t.residual_freq);
   const actStr = Object.entries(activity).map(([k, v]) => `${v} ${k}`).join(' \u25B8 ');
   setText('t-activity', actStr || '\u2014');
@@ -628,7 +727,7 @@ function render(d) {
     sb.innerHTML = sources.map(src => {
       return `
       <tr>
-        <td><span class="state-badge ${esc(stateClass(src.state))}">${esc(src.state)}</span></td>
+        <td><span class="state-badge ${esc(stateClass(displayState(src)))}">${esc(displayState(src))}</span></td>
         <td>${esc(src.name)}</td>
         <td>${esc(src.stratum)}</td>
         <td>${esc(src.poll)}</td>
@@ -701,7 +800,9 @@ function renderHoldover(sync, serverNow) {
   if (!sync || sync.on_gps !== false) { banner.hidden = true; return; }
   banner.hidden = false;
   const ref = sync.reference || '';
-  const freeRunning = !ref || ref.includes('()');
+  // Still naming PPS (or nothing) as the reference means no other source has
+  // taken over: the clock is coasting on its own.
+  const freeRunning = !ref || ref.includes('()') || ref.includes('(PPS)');
   // The snapshot's clock reading is taken a moment before the sync state, so
   // clamp at zero rather than show a negative duration.
   const lost = sync.last_on_gps != null ? Math.max(0, serverNow - sync.last_on_gps) : null;
@@ -710,166 +811,78 @@ function renderHoldover(sync, serverNow) {
   if (lost != null) parts.push(`last on GPS ${formatDuration(lost)} ago`);
   else if (sync.since != null) parts.push(`${sync.since_exact ? '' : 'over '}${formatDuration(Math.max(0, serverNow - sync.since))} without GPS`);
   if (!freeRunning) parts.push(`now using ${ref}`);
+  else if (ref.includes('(PPS)')) parts.push('no pulses arriving; chrony has not switched source yet');
   if (sync.error_bound_s != null) parts.push(`error bound \u00b1${formatSecondsAsHuman(sync.error_bound_s).replace(/^-/, '')}`);
   setText('holdover-detail', parts.join('  \u25B8  '));
 }
 
 function generateFunFact(d) {
-  const offsetStr = esc(d.tracking.last_offset || '');
-  // The facts compare the size of the last offset with other things; assume
-  // a microsecond if chrony has not reported one.
-  const seconds = typeof d.tracking.last_offset_s === 'number'
-    ? Math.abs(d.tracking.last_offset_s) : 1e-6;
-  const ns = seconds * 1e9;
-  const speedOfLight = 299792458;
-  const lightDistance = seconds * speedOfLight;
-  const soundSpeed = 343;
-  const soundDistance = seconds * soundSpeed;
-
-  const fmtMeters = (m) => {
-    if (m < 0.001) return (m * 1000).toFixed(2) + ' mm';
-    if (m < 1)     return (m * 100).toFixed(1) + ' cm';
-    if (m < 1000)  return m.toFixed(2) + ' m';
-    return (m / 1000).toFixed(2) + ' km';
-  };
-
-  const sats = d.gps.sats_used || 0;
-  const visible = d.gps.sats_visible || 0;
-  const alt = d.gps.alt;
-  const ntpRx = parseInt(d.serverstats.ntp_packets_received) || 0;
-  const uptime = esc(d.system.uptime || '');
-  const stratum = esc(d.tracking.stratum);
-  const freq = d.tracking.frequency_ppm || 0;
-  const skew = d.tracking.skew_ppm || 0;
+  // Facts are checked statements. The ones that use live numbers are only
+  // offered when those numbers mean something (on GPS, data available).
+  const t = d.tracking || {};
+  const g = d.gps || {};
+  const hasOffset = typeof t.last_offset_s === 'number';
+  const seconds = hasOffset ? Math.abs(t.last_offset_s) : null;
+  const offsetText = hasOffset ? esc(formatSecondsAsHuman(seconds)) : '';
+  const onGps = d.sync ? d.sync.on_gps : t.stratum === '1';
+  const sats = g.sats_used || 0;
+  const visible = g.sats_visible || 0;
+  const ntpRx = parseInt(d.serverstats && d.serverstats.ntp_packets_received, 10) || 0;
+  const freq = typeof t.frequency_ppm === 'number' ? t.frequency_ppm : null;
   const ppsTotal = (d.pps_irq && d.pps_irq.total) || 0;
-  const temp = esc(d.system.temperature || '');
-  const rootDelay = d.tracking.root_delay || '';
+  const hl = v => `<span class="hl">${v}</span>`;
+  const amber = v => `<span class="hl-amber">${v}</span>`;
+  const meters = m => (m < 0.001 ? (m * 1000).toFixed(2) + ' mm'
+    : m < 1 ? (m * 100).toFixed(1) + ' cm' : m < 1000 ? m.toFixed(1) + ' m' : (m / 1000).toFixed(2) + ' km');
+  const times = v => Math.round(v).toLocaleString() + '×';
 
-  const facts = [
-    // Light & sound at your offset
-    `Your last offset of <span class="hl">${offsetStr}</span> is the time it takes light to travel <span class="hl-amber">${fmtMeters(lightDistance)}</span> in a vacuum.`,
-    `Sound travels just <span class="hl-amber">${fmtMeters(soundDistance)}</span> in the time of your current offset of <span class="hl">${offsetStr}</span>.`,
-    `In the time of your offset, an electron travels less than <span class="hl-amber">${fmtMeters(lightDistance * 0.05)}</span> through copper wire (signals propagate at ~5% of c).`,
-    `Light travels <span class="hl">~30 cm in 1 nanosecond</span>. Your last offset corresponds to about <span class="hl-amber">${fmtMeters(lightDistance)}</span> of light travel.`,
-    `Your offset of <span class="hl">${offsetStr}</span> is roughly the time it takes a photon to travel <span class="hl-amber">${fmtMeters(lightDistance)}</span>. A human hair is 80 microns thick.`,
-    `An optical fiber transmits light at about <span class="hl">2/3 the vacuum speed of light</span>. Your offset equates to ${fmtMeters(lightDistance * 0.67)} of fiber travel.`,
-    `In your current offset, a radio wave at 2.4 GHz Wi-Fi completes only <span class="hl-amber">${Math.max(1, Math.floor(2.4e9 * ns / 1e9)).toLocaleString()}</span> oscillations.`,
-    `A bullet travels at roughly <span class="hl">760 m/s</span>. In the duration of your offset it would move just <span class="hl-amber">${fmtMeters(seconds * 760)}</span>.`,
-    `Earth orbits the Sun at <span class="hl">~30 km/s</span>. In your offset duration, Earth moved <span class="hl-amber">${fmtMeters(seconds * 30000)}</span> along its orbit.`,
-    `The Moon recedes from Earth at <span class="hl">38 mm/year</span>. Your offset is so brief the Moon moved <span class="hl-amber">${(38 * seconds / 31557600 * 1e9).toExponential(2)} nm</span> in that time.`,
+  const live = [];
+  if (hasOffset && seconds > 0) {
+    live.push(
+      `In ${hl(offsetText)}, this server's last correction, light travels ${amber(meters(seconds * 299792458))}.`,
+      `A signal in copper or optical fibre covers about two thirds of light's speed: ${amber(meters(seconds * 2e8))} in this server's last correction of ${hl(offsetText)}.`,
+      `A blink takes about 100 ms, ${amber(times(0.1 / seconds))} longer than this server's last correction of ${hl(offsetText)}.`,
+      `One frame of a 24 fps film lasts 41.7 ms, ${amber(times(0.0417 / seconds))} longer than this server's last correction.`,
+    );
+  }
+  if (onGps && visible > 0) {
+    live.push(`Right now ${hl(`${sats} of ${visible}`)} satellites in view are used to discipline this clock, each about ${amber('20,200 km')} up, moving at about ${amber('14,000 km/h')}.`);
+  }
+  if (freq != null) {
+    live.push(`This Pi's crystal runs ${hl(Math.abs(freq).toFixed(2) + ' ppm ' + (freq > 0 ? 'fast' : 'slow'))}: left alone it would gain or lose ${amber((Math.abs(freq) * 86.4).toFixed(0) + ' ms')} a day. chrony measures that against GPS and cancels it.`);
+  }
+  if (ppsTotal > 0) live.push(`The GPS has sent ${hl(ppsTotal.toLocaleString())} pulse-per-second interrupts since this Pi booted: one at the start of every second while it has a fix.`);
+  if (ntpRx > 0) live.push(`chrony has answered ${hl(ntpRx.toLocaleString())} NTP requests since it last started.`);
 
-    // NTP precision comparisons
-    `A standard NTP query exchange takes around <span class="hl">10 ms</span>. Your server is roughly <span class="hl-amber">${(10000000 / Math.max(ns, 1)).toFixed(0)}x</span> more precise than the round trip.`,
-    `A typical home internet connection has <span class="hl">5-30 ms latency</span> to its NTP source. Your local server delivers time orders of magnitude tighter.`,
-    `Public NTP pool servers offer accuracy around <span class="hl">1-50 ms</span>. Yours is better by a factor of <span class="hl-amber">${(1000000 / Math.max(ns / 1000, 1)).toFixed(0)}x</span>.`,
-    `Windows' built-in w32time targets <span class="hl">~1 second accuracy</span> by default. Your stratum 1 box is roughly <span class="hl-amber">${(1e9 / Math.max(ns, 1)).toExponential(1)}x</span> tighter.`,
-    `Cloudflare's NTP service publishes about <span class="hl">200 microsecond</span> accuracy. Yours beats that by <span class="hl-amber">${(200000 / Math.max(ns / 1000, 1)).toFixed(0)}x</span>.`,
-    `Apple's time.apple.com is stratum 2. You're <span class="hl">one level closer to the source</span>, with no upstream server between you and atomic time.`,
-
-    // GPS / orbital
-    `Right now <span class="hl">${sats} of ${visible}</span> visible satellites are being used to discipline this clock. Each one is roughly <span class="hl-amber">20,200 km</span> overhead, moving at <span class="hl-amber">14,000 km/h</span>.`,
-    `GPS satellite atomic clocks tick about <span class="hl">38 microseconds per day</span> faster than ours due to relativity. Your offset is <span class="hl-amber">${(38000 / Math.max(ns / 1000, 1)).toFixed(0)}x</span> better than that drift.`,
-    `Each GPS satellite carries <span class="hl">two rubidium and two cesium atomic clocks</span>, kept in agreement and continuously monitored by ground control.`,
-    `GPS satellites orbit Earth twice per sidereal day, at an altitude of <span class="hl">20,200 km</span>. Their signals reach you about <span class="hl-amber">67 ms</span> after transmission.`,
-    `The GPS constellation has <span class="hl">31 operational satellites</span> currently. You can typically see 8-12 above the horizon at any time.`,
-    `A GPS satellite must broadcast its position to within <span class="hl">a few meters</span> for your fix to work. That requires its onboard clocks to agree to within <span class="hl-amber">~10 ns</span>.`,
-    `GPS time started at <span class="hl">midnight UTC, January 6, 1980</span>. It has not had a leap second adjustment since, which is why GPS time is now 18 seconds ahead of UTC.`,
-    `Your altitude reading of <span class="hl">${alt != null ? alt.toFixed(0) + ' m' : 'unknown'}</span> comes from triangulating signals that left GPS satellites about <span class="hl-amber">67 milliseconds ago</span>.`,
-    `Your position fix is computed from at least <span class="hl">4 satellites</span>: three for X/Y/Z, and one extra to solve for the receiver's clock offset.`,
-    `Russia's GLONASS, China's BeiDou, and Europe's Galileo each operate <span class="hl">independent satellite constellations</span> for global positioning. Many modern receivers combine all four.`,
-    `A GPS satellite weighs about <span class="hl">2,000 kg</span> and is powered by solar panels generating roughly <span class="hl-amber">1.5 kW</span>.`,
-    `The signal you receive from each GPS satellite is below the noise floor, weaker than <span class="hl">-130 dBm</span>. Your receiver de-spreads it using known pseudo-random codes.`,
-    `If GPS satellites didn't correct for relativity, position fixes would drift by <span class="hl-amber">~11 km per day</span>.`,
-    `GPS satellites broadcast on <span class="hl">L1 (1575.42 MHz)</span> and <span class="hl">L2 (1227.60 MHz)</span>. Civilian receivers primarily use L1 C/A code.`,
-    `A single GPS L1 carrier wave cycle takes <span class="hl">0.65 nanoseconds</span>. Your timing precision is in that same neighborhood.`,
-    `Sky-view satellites visible to your antenna right now: <span class="hl">${visible}</span>. The maximum theoretically observable from any point on Earth is around <span class="hl-amber">12</span> at once.`,
-
-    // Human comparisons
-    `A human eye blinks in about <span class="hl">100 milliseconds</span>. Your last offset is <span class="hl-amber">${(1e8 / Math.max(ns, 1)).toFixed(0)}x</span> faster than a blink.`,
-    `A neuron in your brain fires in about <span class="hl">1 millisecond</span>. Your last offset is <span class="hl-amber">${(1e6 / Math.max(ns, 1)).toFixed(0)}x</span> shorter than one neural firing.`,
-    `The fastest human reaction time on record is about <span class="hl">100 ms</span>. Your offset is <span class="hl-amber">${(1e8 / Math.max(ns, 1)).toFixed(0)}x</span> tighter than human reflexes.`,
-    `Audio engineers can perceive timing differences down to about <span class="hl">10 microseconds</span> between ears. Your offset is <span class="hl-amber">${(10000 / Math.max(ns / 1000, 1)).toFixed(0)}x</span> smaller.`,
-    `A high-speed camera shooting at <span class="hl">10,000 frames per second</span> captures one frame every 100 microseconds. Your offset is far below that.`,
-    `Movies project at <span class="hl">24 frames per second</span>, so one frame is 41.7 ms. Your offset is <span class="hl-amber">${(41.7e6 / Math.max(ns, 1)).toFixed(0)}x</span> shorter than a single film frame.`,
-
-    // Frequency, drift, skew
-    `Your clock's frequency error is <span class="hl">${freq.toFixed(2)} ppm</span>. A typical wristwatch drifts at around <span class="hl-amber">10-50 ppm</span>.`,
-    `Your skew of <span class="hl">${skew.toFixed(3)} ppm</span> means your local oscillator can drift by less than <span class="hl-amber">${(skew * 86.4).toFixed(0)} microseconds per day</span> if left undisciplined.`,
-    `The Pi 4's crystal oscillator runs at <span class="hl">19.2 MHz</span>. Without GPS discipline, it would drift by roughly <span class="hl-amber">${Math.abs(freq * 86.4).toFixed(0)} ms per day</span>.`,
-    `A quartz crystal in a typical computer drifts by <span class="hl">several seconds per day</span>. Yours is corrected continuously, kept to nanoseconds.`,
-    `Temperature changes of <span class="hl">1°C</span> shift a typical quartz oscillator's frequency by about <span class="hl-amber">0.04 ppm</span>. Your CPU at ${temp || '37°C'} is being compensated in real time.`,
-    `Your residual frequency tells chrony how much its current correction is missing the mark. Values near zero mean the loop has fully converged.`,
-    `Allan deviation measures how a clock's frequency varies over different averaging intervals. A typical TCXO sits around <span class="hl">10^-7</span>; your GPS-disciplined clock reaches <span class="hl-amber">10^-9</span> or better.`,
-
-    // Stratum and NTP fundamentals
-    `Stratum <span class="hl">${stratum}</span> means you're directly disciplined by GPS. Most internet NTP clients you'll meet are stratum 3 or worse.`,
-    `NTP stratum increases by one for each layer down the hierarchy. Reference clocks (atomic, GPS) are stratum 0. You read from one directly, making you stratum 1.`,
-    `The first NTP RFC was published in <span class="hl">1985</span>. The protocol you're running has been refined for over <span class="hl-amber">40 years</span>.`,
-    `NTP version 4, the current spec, was standardized in <span class="hl">RFC 5905 (2010)</span>. Chrony implements it with optional NTS extensions for authentication.`,
-    `The NTP packet you send is exactly <span class="hl">48 bytes</span> on the wire. The protocol has changed very little since the 1980s.`,
-    `Chrony was created by <span class="hl">Richard Curnow</span> in 1997, designed for systems with intermittent network connections, like dial-up. It now powers Stratum 1 servers worldwide.`,
-    `Many Linux distributions replaced ntpd with chrony as the default time daemon between <span class="hl">2014 and 2020</span>, citing faster convergence and lower resource use.`,
-
-    // Server activity
-    `Since boot, this server has answered <span class="hl">${ntpRx.toLocaleString()}</span> NTP packets. ${uptime}.`,
-    `An NTP exchange uses <span class="hl">UDP port 123</span>. The 48-byte packet has been the same shape since 1985.`,
-    `Your server is operating <span class="hl">stateless</span>. It doesn't track clients; each query is independent. Yet you still see <span class="hl-amber">${ntpRx.toLocaleString()}</span> requests served.`,
-
-    // PPS and discipline
-    `Your PPS pulse has fired <span class="hl">${ppsTotal.toLocaleString()}</span> times since boot. That's one per second from a satellite signal originating in space.`,
-    `PPS stands for <span class="hl">Pulse Per Second</span>. A precise voltage rising edge from your GPS module marks the start of each second to within nanoseconds.`,
-    `Your PPS signal arrives as a hardware interrupt, bypassing the OS scheduler entirely. That's why GPS-disciplined Linux can hit nanosecond precision.`,
-    `Without PPS, GPS time discipline is limited to about <span class="hl">100 ms</span> due to serial data jitter. With PPS, you can reach <span class="hl-amber">tens of nanoseconds</span>.`,
-
-    // Physics / relativity / metrology
-    `Cesium-133 atoms vibrate <span class="hl">9,192,631,770 times per second</span>. That's the official definition of one second since 1967.`,
-    `The kilogram was redefined in 2019 using Planck's constant. The second, however, has been atomically defined since <span class="hl">1967</span>. Time is the most precisely measured quantity in physics.`,
-    `One nanosecond per year is the accuracy of the best lab atomic clocks. Your server is about <span class="hl">${(ns / 1).toFixed(0)}x</span> less accurate, but still excellent for civilian use.`,
-    `NIST's <span class="hl">NIST-F2 fountain clock</span> would neither gain nor lose a second in 300 million years. Your clock is about a million times less precise, but a billion times cheaper.`,
-    `The Earth's rotation slows by about <span class="hl">1.7 ms per century</span>. Your clock is more stable than the planet itself.`,
-    `A second on a GPS satellite is measurably <span class="hl">~38 microseconds longer per day</span> than one on Earth, due to weaker gravity (general relativity).`,
-    `Time runs slower in stronger gravity. The clock at your feet ticks <span class="hl">10^-16</span> slower than one near your head, a difference measurable with optical lattice clocks.`,
-    `The world's most precise clock, an optical lattice strontium clock at JILA, has uncertainty around <span class="hl">10^-18</span>, equivalent to losing one second in the age of the universe.`,
-    `Coordinated Universal Time (UTC) is maintained by averaging <span class="hl">~400 atomic clocks</span> at <span class="hl-amber">~80 labs</span> worldwide. The result is published monthly by the BIPM in Paris.`,
-    `International Atomic Time (TAI) doesn't include leap seconds. UTC stays close to solar time by inserting them periodically. <span class="hl">UTC = TAI - 37 seconds</span> right now.`,
-    `Stock exchanges require time accuracy of <span class="hl">100 microseconds</span> for trade timestamps. You're <span class="hl-amber">${(100000 / Math.max(ns / 1000, 1)).toFixed(0)}x</span> better than that requirement.`,
-    `MiFID II regulations require financial firms to timestamp orders to <span class="hl">100 microseconds</span> traceable to UTC. Your stratum 1 box would satisfy that requirement out of the box.`,
-    `Power grids synchronize their AC waveforms to <span class="hl">±10 microseconds</span> across continents. Time disciplines power as much as it disciplines computers.`,
-    `Cellular base stations require time sync to <span class="hl">a few microseconds</span> for handoffs to work. Your server is precise enough to run a small cell network.`,
-
-    // Leap seconds and edge cases
-    `GPS time is currently <span class="hl">18 seconds ahead of UTC</span> due to leap seconds. Your chrony daemon handles that conversion automatically.`,
-    `A leap second has not been added since <span class="hl">December 31, 2016</span>. In 2022, the world's metrologists voted to abolish leap seconds by 2035.`,
-    `The clock has experienced <span class="hl">27 leap seconds</span> since UTC was synchronized to atomic time in 1972. All but one were positive (extra seconds added).`,
-    `Negative leap seconds, where the clock skips a second, have never been needed but remain part of the spec. Earth's rotation has slightly sped up in recent years.`,
-
-    // Performance / math
-    `A modern CPU executes about <span class="hl">3 billion instructions per second</span>. In your current offset of <span class="hl-amber">${offsetStr}</span>, it could run roughly <span class="hl">${Math.max(1, Math.floor(3 * ns)).toLocaleString()}</span> instructions.`,
-    `If your offset stays at <span class="hl">${offsetStr}</span>, your clock would gain or lose only <span class="hl-amber">${(ns * 86400 / 1e9).toFixed(6)} seconds per day</span>.`,
-    `Root delay of <span class="hl">${rootDelay}</span> is the round-trip latency to your time reference. For GPS-disciplined clocks this should be near zero.`,
-    `Your CPU is running at <span class="hl">${temp}</span>. Atomic clocks in GPS satellites are kept at constant temperature in deep space, varying by less than <span class="hl-amber">1°C</span>.`,
-    `The Allan deviation of a typical TCXO is <span class="hl">10^-7</span>. Your GPS-disciplined clock achieves better than <span class="hl-amber">10^-9</span> after stabilization.`,
-
-    // Hardware tidbits
-    `The Raspberry Pi's broadcom SoC has a hardware <span class="hl">system timer</span> running at 1 MHz, accessible via memory-mapped registers, giving microsecond precision before any GPS help.`,
-    `Your GPS module's antenna is sensitive to signals weaker than a millionth of a billionth of a watt. Yet from <span class="hl">20,200 km away</span>, it pulls out timing to nanoseconds.`,
-    `A typical GPS receiver chipset draws under <span class="hl">100 mW</span>. The satellites broadcasting to it draw <span class="hl-amber">15,000x</span> more power.`,
-    `The PPS signal often arrives via a single GPIO pin. From a hardware perspective, a Stratum 1 time server can be built around <span class="hl">three wires and a $30 module</span>.`,
-
-    // History
-    `Before atomic clocks, the second was defined as <span class="hl">1/86,400 of a mean solar day</span>. We discovered Earth's rotation was too erratic for precision science.`,
-    `John Harrison built the first marine chronometer in 1761 to solve the longitude problem. His H4 lost only <span class="hl">5 seconds in 81 days</span> at sea, a feat unrivaled for a century.`,
-    `The transatlantic telegraph cable of 1858 was the first time signal sent globally. It marked the beginning of synchronized world time.`,
-    `Railway time forced the first time zones in the 1840s. Before that, every town kept its own local solar time. Your clock now synchronizes with all of them via a single second standard.`,
-    `Greenwich Mean Time (GMT) was adopted as the world reference in <span class="hl">1884</span> at the International Meridian Conference. UTC replaced it in 1972 as the atomic-based successor.`,
-
-    // Bandwidth and packet trivia
-    `NTP traffic is among the lightest on the internet, around <span class="hl">90 bytes per packet</span> including UDP/IP headers. Your server handles thousands of these for negligible bandwidth.`,
-    `An NTP packet's timestamp field uses <span class="hl">64 bits</span>: 32 for seconds since 1900, 32 for fractional seconds (~233 picosecond resolution).`,
-    `NTP's timestamp will roll over in <span class="hl">2036</span>. NTPv4's 128-bit Era field already solves this, but most implementations still rely on the 32-bit format.`,
-    `Public NTP server "ntp.org" handles <span class="hl">over a billion packets per day</span> globally. Your private server avoids that load entirely.`,
+  const fixed = [
+    `One second is defined as ${hl('9,192,631,770')} oscillations of a caesium-133 atom, a definition in use since ${amber('1967')}.`,
+    `GPS satellite clocks run about ${hl('38 microseconds a day')} fast compared with clocks on the ground, from relativity. The system corrects for it; without that, positions would drift by roughly ${amber('10 km a day')}.`,
+    `GPS time began at midnight on ${hl('6 January 1980')} and has no leap seconds, so it is now ${amber('18 seconds')} ahead of UTC.`,
+    `International Atomic Time has no leap seconds either: ${hl('UTC = TAI − 37 s')} today.`,
+    `There have been ${hl('27 leap seconds')} since 1972, all of them positive. The last was on ${amber('31 December 2016')}, and in 2022 metrologists voted to stop adding them by 2035.`,
+    `A position needs at least ${hl('4 satellites')}: three for position and a fourth to solve for the receiver's own clock error.`,
+    `GPS signals reach the ground at around ${hl('−130 dBm')}, below the background noise. Receivers dig them out by correlating with each satellite's known code.`,
+    `GPS satellites are about ${hl('20,200 km')} up; their signals take about ${amber('67 ms')} to arrive.`,
+    `One cycle of the GPS L1 carrier (${hl('1575.42 MHz')}) lasts ${amber('0.63 ns')}.`,
+    `An NTP timestamp has ${hl('32 bits')} of seconds since 1900 and ${hl('32 bits')} of fraction, a resolution of about ${amber('233 picoseconds')}.`,
+    `NTP's 32-bit seconds count wraps around in ${hl('February 2036')}; NTP software handles it by working out which 136-year era it is in.`,
+    `An NTP request is a ${hl('48-byte')} packet, ${amber('76 bytes')} with its UDP and IPv4 headers.`,
+    `The first NTP specification, ${hl('RFC 958')}, was published in ${amber('1985')}. The current version, NTPv4, is ${hl('RFC 5905')} (2010).`,
+    `NTS (Network Time Security, ${hl('RFC 8915')}) lets a client check that the time really came from this server and was not altered on the way.`,
+    `Stratum counts steps from a reference clock: GPS is stratum 0, a server disciplined directly by it is ${hl('stratum 1')}, its clients are stratum 2.`,
+    `Without a pulse-per-second signal, timing from GPS's serial NMEA messages is good to milliseconds at best. ${hl('PPS')} brings it to around a microsecond or better.`,
+    `Quartz crystals change rate with temperature, typically by ${hl('a fraction of a ppm per \u00b0C')}. The Frequency and Temperature chart below shows this Pi's.`,
+    `Time runs slower lower down: optical clocks can measure the difference between two heights ${hl('one metre')} apart.`,
+    `The best optical atomic clocks would drift by ${hl('less than a second')} over the age of the universe.`,
+    `The day is getting longer by about ${hl('1.7 ms per century')} on average as tides slow the Earth's spin.`,
+    `John Harrison's H4 marine timekeeper lost only about ${hl('5 seconds')} on its 81-day trial voyage to Jamaica in 1761–62.`,
+    `Before 1967 the second was defined as ${hl('1/86,400')} of a mean solar day; the Earth's rotation proved too irregular.`,
+    `Great Britain's railways adopted a single "railway time" from the ${hl('1840s')}; before that each town kept its own local time.`,
+    `Greenwich was chosen as the prime meridian in ${hl('1884')}. UTC, kept by atomic clocks, became the world's time standard in ${amber('1972')}.`,
+    `EU financial rules (MiFID II) require the fastest trading systems to timestamp to within ${hl('100 microseconds')} of UTC.`,
+    `chrony was written by ${hl('Richard Curnow')} in the late 1990s for machines on intermittent dial-up connections; it is now the default on many Linux distributions.`,
   ];
-
+  const facts = live.concat(fixed);
   return facts[Math.floor(Math.random() * facts.length)];
 }
 
@@ -985,7 +998,7 @@ function drawHistoryChart(id, series) {
   }
   if (!drew) {
     svg.appendChild(svgEl('text', { x: '50%', y: '50%', 'text-anchor': 'middle',
-      fill: '#4a6080', 'font-size': 10, 'font-family': 'Space Mono' }))
+      fill: '#7f93b2', 'font-size': 10, 'font-family': 'Space Mono' }))
       .textContent = 'NO DATA YET - one sample is recorded each minute';
   }
 }
@@ -1123,10 +1136,11 @@ function startProgress() {
 const GLOSSARY = {
   // Header meta
   'Node': 'The IP address this server is reachable at on the local network. Clients use this address to query for time.',
-  'Uptime': 'How long the chrony daemon has been continuously running since the last boot or restart.',
+  'Uptime': 'How long the Pi has been running since it last booted.',
   'Core Temp': 'Temperature of the CPU. Affects the local oscillator frequency. Stable temperatures yield more stable clocks.',
-  'Mission Time': 'The current system time as reported by the server, in UTC. Refreshed each time telemetry is fetched.',
+  'Mission Time': 'The server\'s UTC time when the data on this page was collected (refreshed every few seconds).',
   'Status': 'TRANSMITTING means chrony has a synchronised source and is serving time. NOT SYNCED means it has none. NO LINK means this page cannot reach the dashboard server, so everything shown is old.',
+  'Server time': 'The server\'s own clock, measured from your browser: a few quick requests, keeping the one with the shortest round trip, as an NTP client would. The line below compares it with your device\'s clock.',
 
   // GPS Subsystem
   'Fix Mode': '3D means latitude, longitude, and altitude are all being computed. 2D means altitude is unavailable. No Fix means the receiver cannot solve a position.',
@@ -1134,16 +1148,16 @@ const GLOSSARY = {
   'Best SNR (dB-Hz)': 'Signal-to-noise ratio of the strongest satellite signal. Higher is better. Values above 40 dB-Hz indicate excellent reception.',
   'HDOP': 'Horizontal Dilution of Precision. A geometric quality factor for the horizontal position fix. Lower is better: <1 is ideal, 1-2 is excellent, 2-5 is good, >5 is poor.',
   'PDOP': 'Position Dilution of Precision. Combines horizontal and vertical geometry. Lower means the satellites are well-distributed for an accurate 3D fix.',
-  'Altitude': 'Height above the WGS84 ellipsoid (approximately mean sea level). Typically less accurate than horizontal position due to satellite geometry.',
+  'Altitude': 'Height above mean sea level as the GPS reports it. Less accurate than the horizontal position because of the satellites\' geometry.',
   'Time Since Lock': 'How long the receiver has held a fix without a break, as tracked by this dashboard (checked every 10 seconds). A leading ">" means the fix was already there when the dashboard started, so the true figure is longer.',
 
   // Offset / Stratum / Frequency
-  'System Offset': 'The estimated difference between your system clock and the true reference time. Smaller is better; near-zero values indicate excellent discipline.',
-  'Last Offset': 'The most recent measured offset between your clock and the GPS reference at the last update.',
+  'System Offset': 'The last correction chrony made to the server\'s clock against its reference. Smaller is better; under 10 \u00b5s is excellent.',
+  'Last Offset': 'The correction chrony made to the server\'s clock at its last update, against GPS.',
   'Stratum Level': 'Your position in the NTP hierarchy. Stratum 0 is the reference clock itself (GPS, atomic). Stratum 1 reads directly from it. Each downstream layer adds 1.',
   'NTP Stratum': 'Stratum number assigned to packets your server sends out. Lower means closer to the time source. 1 is the lowest a server can advertise.',
-  'Frequency Drift': 'How much the local oscillator drifts per second relative to true time, expressed in parts per million (ppm). Chrony compensates for this in real time.',
-  'Clock Offset': 'The current frequency correction chrony is applying to keep your clock locked. Reflects how far off the raw oscillator runs.',
+  'Frequency Drift': 'How far the Pi\'s own crystal runs from the true rate, in parts per million (1 ppm = 86.4 ms a day). chrony measures it against GPS and cancels it continuously.',
+  'Crystal Rate Error': 'How fast or slow the Pi\'s own crystal runs, in parts per million, before correction. A few ppm is normal: chrony measures it against GPS and cancels it, so the served time is not affected.',
 
   // PPS card
   'PPS Discipline (recent samples)': 'A sparkline of recent Pulse-Per-Second samples from the GPS receiver. Tighter clustering means more stable hardware timing.',
@@ -1198,18 +1212,18 @@ const GLOSSARY = {
 
   // Cards / section titles
   'GPS Subsystem': 'Live status of the GPS receiver and the satellites it can see.',
-  'Authoritative Time (Disseminated From This Node)': 'The current time this server is broadcasting to NTP clients. This is what your network sees as "the truth".',
+  "This Server's Time Around the World": 'The server\'s clock shown in other time zones. It is the server\'s time, corrected for the network delay to your browser, not your device\'s clock.',
   'Time Sources': 'List of upstream time references chrony is comparing against. For a stratum 1 server, refclocks (GPS, PPS) appear here.',
   'Source Statistics': 'Long-term statistics for each source: sample counts, frequency, offset, and standard deviation.',
   'Connected Clients': 'Devices currently being served NTP time by this node.',
 
   // Time Sources table headers
-  'State': 'Source state symbol: * (synced), + (combined), - (not combined), ? (unreachable, or unusable if it still answers), x (false ticker), ~ (too variable). Sources configured with noselect show as noselect.',
+  'State': 'synced: the source chrony follows. silent: still selected but no longer answering. combined / not combined: used, or only compared. unreachable, unusable, false ticker, too variable: not trusted right now. noselect: configured never to be followed (NMEA here only numbers the PPS pulses).',
   'Source': 'Hostname, IP, or refclock identifier of the time source.',
   'Stratum': 'Stratum level reported by this source.',
   'Poll': 'log2 of the polling interval in seconds. A poll of 6 means querying every 64 seconds.',
   'Reach': 'Octal value tracking the last 8 polls. 377 (octal) means all 8 recent polls succeeded.',
-  'Last Rx': 'Time since the last packet was received from this source, in seconds.',
+  'Last Rx': 'Time since the last sample from this source: seconds, or minutes (m), hours (h), days (d).',
   'Offset': 'Measured time difference between your clock and this source.',
   'Margin': 'Estimated error margin on the last measurement.',
 
@@ -1331,6 +1345,8 @@ async function fetchData() {
 
 updateWorldClock();
 attachTooltips();
+syncWithServer();
+setInterval(syncWithServer, TIME_SYNC_EVERY_MS);
 fetchData();
 setInterval(fetchData, REFRESH_S * 1000);
 fetchHistory();
